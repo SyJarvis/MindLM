@@ -18,7 +18,7 @@ class PretrainDataset(Dataset):
         self.df = df
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.padding = 0
+        self.padding = tokenizer.pad_token_id
 
     def __len__(self):
         return self.df.shape[0]
@@ -26,7 +26,7 @@ class PretrainDataset(Dataset):
     def __getitem__(self, index: int):
         #
         sample = self.df.iloc[index]
-        text = f"{self.tokenizer.bos_token}{str(sample['text'])}{self.tokenizer.eos_token}"
+        text = str(sample['text'])
         input_id = self.tokenizer(text).data['input_ids'][:self.max_length]
         text_len = len(input_id)
         # 没满最大长度的剩余部分
@@ -51,8 +51,9 @@ class SFTDataset(Dataset):
         self.answer_max_len = answer_max_len
         #
         self.tokenizer = tokenizer
-        self.padding = 0
-        self.bos_id = self.tokenizer('<s>assistant').data['input_ids']
+        self.padding = tokenizer.pad_token_id
+        # 兼容 Qwen2.5 的 <|im_start|>assistant 格式
+        self.bos_id = self.tokenizer('<|im_start|>assistant').data['input_ids']
 
     def __len__(self):
         return self.df.shape[0]

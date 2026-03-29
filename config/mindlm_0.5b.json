@@ -1,0 +1,30 @@
+{
+    "model_type": "mindlm",
+    "dim": 576,
+    "n_layers": 12,
+    "n_heads": 9,
+    "n_kv_heads": 3,
+    "vocab_size": 6400,
+    "max_seq_len": 512,
+    "dropout": 0.0,
+    "norm_eps": 1e-6,
+    "hidden_dim": null,
+    "multiple_of": 256,
+    "use_moe": false,
+    "use_linear_attn": true,
+    "conv_kernel_size": 4,
+    "layer_types": [
+        "linear_attention",
+        "linear_attention",
+        "attention",
+        "linear_attention",
+        "linear_attention",
+        "attention",
+        "linear_attention",
+        "linear_attention",
+        "attention",
+        "linear_attention",
+        "linear_attention",
+        "attention"
+    ]
+}

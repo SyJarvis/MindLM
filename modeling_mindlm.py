@@ -226,11 +226,12 @@ class GatedDeltaNet(nn.Module):
         x = x * F.silu(gate.float())
         return x.to(input_dtype)
 
-    def simple_gated_delta_attention(self, query, key, value, g, beta):
-        """简化的Gated Delta Attention"""
-        batch_size, seq_len, num_heads, head_dim = query.shape
-        v_dim = value.shape[-1]
+    def simple_gated_delta_attention(self, query, key, value, g, beta, chunk_size=64):
+        """Chunked Gated Delta Attention — 分块并行计算，替代逐时间步Python循环
 
+        将序列分成 chunk_size 大小的块，块内用矩阵乘法并行计算，
+        块间传递 recurrent state。将 Python 循环从 T 次降到 T/chunk_size 次。
+        """
         query = query.transpose(1, 2).contiguous()
         key = key.transpose(1, 2).contiguous()
         value = value.transpose(1, 2).contiguous()
@@ -242,26 +243,65 @@ class GatedDeltaNet(nn.Module):
         scale = 1 / (query.shape[-1] ** 0.5)
         query = query * scale
 
-        output = []
+        batch_size, num_heads, seq_len, head_dim = query.shape
+        v_dim = value.shape[-1]
+
+        # g 已经是 log-space（负值），exp(g) 给出 (0,1) 的衰减因子
+        log_g = g  # (B, H, T)
+
+        num_chunks = (seq_len + chunk_size - 1) // chunk_size
+        output_chunks = []
         recurrent_state = torch.zeros(batch_size, num_heads, head_dim, v_dim,
-                                     device=query.device, dtype=query.dtype)
+                                      device=query.device, dtype=query.dtype)
 
-        for t in range(seq_len):
-            q_t = query[:, :, t:t+1, :]
-            k_t = key[:, :, t:t+1, :]
-            v_t = value[:, :, t:t+1, :]
-            beta_t = beta[:, :, t:t+1]
-            g_t = g[:, :, t:t+1].exp()
+        for c in range(num_chunks):
+            start = c * chunk_size
+            end = min(start + chunk_size, seq_len)
+            C = end - start
 
-            recurrent_state = recurrent_state * g_t.unsqueeze(-1)
-            kv = torch.matmul(k_t.transpose(-2, -1), v_t * beta_t.unsqueeze(-1))
-            recurrent_state = recurrent_state + kv
+            q_c = query[:, :, start:end]       # (B, H, C, D)
+            k_c = key[:, :, start:end]         # (B, H, C, D)
+            v_c = value[:, :, start:end]       # (B, H, C, V)
+            beta_c = beta[:, :, start:end]     # (B, H, C)
+            log_g_c = log_g[:, :, start:end]   # (B, H, C)
 
-            out_t = torch.matmul(q_t, recurrent_state)
-            output.append(out_t)
+            # 块内 log 空间累积和：log_cg[i] = sum_{u=0}^{i} log(g[u])
+            log_cg = torch.cumsum(log_g_c, dim=-1)  # (B, H, C)
 
-        output = torch.cat(output, dim=2)
-        output = output.transpose(1, 2).contiguous()
+            # === 块内：衰减加权线性注意力 ===
+            # 衰减比 log_ratio[i,j] = log_cg[i] - log_cg[j]，对应 g[j+1]*...*g[i]
+            log_ratio = log_cg.unsqueeze(-1) - log_cg.unsqueeze(-2)  # (B, H, C, C)
+            causal_mask = torch.tril(
+                torch.ones(C, C, device=query.device, dtype=query.dtype)
+            )
+
+            # 衰减加权注意力矩阵
+            # clamp(max=0) 防止上三角 exp 溢出：exp(大正数) * mask(0) = inf*0 = NaN
+            qk = torch.matmul(q_c, k_c.transpose(-2, -1))  # (B, H, C, C)
+            decay_attn = torch.exp(log_ratio.clamp(max=0)) * causal_mask * qk  # (B, H, C, C)
+
+            v_beta = v_c * beta_c.unsqueeze(-1)  # (B, H, C, V)
+            intra_out = torch.matmul(decay_attn, v_beta)  # (B, H, C, V)
+
+            # === 块间：recurrent state 贡献 ===
+            inter_out = torch.exp(log_cg).unsqueeze(-1) * torch.matmul(q_c, recurrent_state)
+            # (B, H, C, 1) * (B, H, C, V) = (B, H, C, V)
+
+            output_chunks.append(intra_out + inter_out)
+
+            # === 更新 recurrent state 传给下一个 chunk ===
+            # 直接计算 exp(log_cg_last - log_cg) 而非 exp(-log_cg) * exp(log_cg_last)
+            # 因为 log_cg_last - log_cg <= 0，exp 不会溢出
+            log_decay_to_last = log_cg[:, :, -1:] - log_cg  # (B, H, C)，始终 <= 0
+            decay_weight = torch.exp(log_decay_to_last)      # (B, H, C)，(0, 1]
+            v_beta_weighted = v_beta * decay_weight.unsqueeze(-1)  # (B, H, C, V)
+            kv_sum = torch.matmul(k_c.transpose(-2, -1), v_beta_weighted)  # (B, H, D, V)
+
+            cg_last = torch.exp(log_cg[:, :, -1:])  # (B, H, 1)
+            recurrent_state = cg_last.unsqueeze(-1) * recurrent_state + kv_sum
+
+        output = torch.cat(output_chunks, dim=2)  # (B, H, T, V)
+        output = output.transpose(1, 2).contiguous()  # (B, T, H, V)
         return output
 
 
@@ -368,11 +408,11 @@ class MOEFeedForward(nn.Module):
 
         if self.training:
             x = x.repeat_interleave(self.args.num_experts_per_tok, dim=0)
-            y = torch.empty_like(x, dtype=torch.float16)
+            y = torch.empty_like(x)
             for i, expert in enumerate(self.experts):
                 mask = flat_topk_idx == i
                 if mask.any():
-                    y[mask] = expert(x[mask])
+                    y[mask] = expert(x[mask]).to(y.dtype)
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
             y = y.view(*orig_shape)
         else:
@@ -409,64 +449,71 @@ class MindLMConfig(PretrainedConfig):
     model_type = "mindlm"
     def __init__(
         self,
-        dim: int = 512,
-        n_layers: int = 8,
-        n_heads: int = 8,
-        n_kv_heads: int = None,
-        vocab_size: int = 10000,
-        max_seq_len: int = 512,
-        dropout: float = 0.0,
-        norm_eps: float = 1e-6,
-        hidden_dim: int = None,
-        multiple_of: int = 256,
-        # MoE参数
-        use_moe: bool = True,
-        n_routed_experts: int = 8,
-        num_experts_per_tok: int = 2,
-        n_shared_experts: int = 1,
-        scoring_func: str = 'softmax',
-        aux_loss_alpha: float = 0.01,
-        seq_aux: bool = True,
-        norm_topk_prob: bool = True,
-        # Linear Attention参数
-        use_linear_attn: bool = True,
-        layer_types: List[str] = None,
-        conv_kernel_size: int = 4,
+        # ========== 核心维度参数 ==========
+        dim: int = 512,                   # 模型隐藏维度（如 576=0.5B, 768=1B）
+        n_layers: int = 8,                # Transformer 层数（如 12=0.5B, 16=1B）
+        n_heads: int = 8,                 # 查询注意力头数（Q heads）
+        n_kv_heads: int = None,           # KV头数，None表示等于n_heads；设为更小值启用GQA（如3=4:1比例）
+        # ========== 词表与上下文 ==========
+        vocab_size: int = 6400,           # 分词器词表大小
+        max_seq_len: int = 512,         # 最大序列长度（0.5B=512, 1B=1024）
+        # ========== 归一化与FFN参数 ==========
+        dropout: float = 0.0,             # Dropout 比率，预训练通常为 0
+        norm_eps: float = 1e-6,           # RMSNorm 的 epsilon，防止除零
+        hidden_dim: int = None,           # FFN 隐藏维度，None 时自动计算为 int(2*4*dim/3)
+        multiple_of: int = 256,           # FFN hidden_dim 对齐到此值的倍数，提高硬件利用率
+        # ========== MoE 参数 ==========
+        use_moe: bool = True,             # 是否使用 MoE（混合专家）FFN，False 则用普通 SwiGLU FFN
+        n_routed_experts: int = 8,        # 路由专家总数（use_moe=True 时生效）
+        num_experts_per_tok: int = 2,     # 每个 token 激活的专家数（Top-K）
+        n_shared_experts: int = 1,        # 共享专家数（始终激活，不参与路由）
+        scoring_func: str = 'softmax',    # 路由评分函数，可选 'softmax' 或 'sigmoid'
+        aux_loss_alpha: float = 0.01,     # 负载均衡辅助损失系数
+        seq_aux: bool = True,             # 是否在序列级别计算辅助损失
+        norm_topk_prob: bool = True,      # 是否归一化 Top-K 专家概率权重
+        # ========== 混合注意力架构 ==========
+        use_linear_attn: bool = True,     # 是否启用混合注意力（False 则全部用标准 Attention）
+        layer_types: List[str] = None,    # 每层的注意力类型列表，如 ["linear_attention","attention",...]
+                                          # None 时自动生成交替模式（use_linear_attn=True）
+                                          # 推荐每4层一个标准attention（如1B: 12线性+4标准）
+        # ========== GatedDeltaNet 特定参数 ==========
+        conv_kernel_size: int = 4,        # 因果卷积核大小，提供局部位置感知，替代位置编码
         **kwargs
     ):
         super().__init__(**kwargs)
-        self.dim = dim
-        self.n_layers = n_layers
-        self.n_heads = n_heads
-        self.n_kv_heads = n_kv_heads
-        self.vocab_size = vocab_size
-        self.max_seq_len = max_seq_len
-        self.dropout = dropout
-        self.norm_eps = norm_eps
-        self.hidden_dim = hidden_dim
-        self.multiple_of = multiple_of
+        self.dim = dim                    # 模型隐藏维度
+        self.n_layers = n_layers          # Transformer 层数
+        self.n_heads = n_heads            # Q 注意力头数
+        self.n_kv_heads = n_kv_heads      # KV 注意力头数（GQA）
+        self.vocab_size = vocab_size      # 词表大小
+        self.max_seq_len = max_seq_len    # 最大序列长度
+        self.dropout = dropout            # Dropout
+        self.norm_eps = norm_eps          # RMSNorm epsilon
+        self.hidden_dim = hidden_dim      # FFN 隐藏维度
+        self.multiple_of = multiple_of    # FFN 维度对齐基数
 
-        # MoE
-        self.use_moe = use_moe
-        self.n_routed_experts = n_routed_experts
-        self.num_experts_per_tok = num_experts_per_tok
-        self.n_shared_experts = n_shared_experts
-        self.scoring_func = scoring_func
-        self.aux_loss_alpha = aux_loss_alpha
-        self.seq_aux = seq_aux
-        self.norm_topk_prob = norm_topk_prob
+        # MoE 混合专家
+        self.use_moe = use_moe                      # 是否启用 MoE
+        self.n_routed_experts = n_routed_experts    # 路由专家数
+        self.num_experts_per_tok = num_experts_per_tok  # 每 token 激活专家数
+        self.n_shared_experts = n_shared_experts    # 共享专家数
+        self.scoring_func = scoring_func            # 路由评分函数
+        self.aux_loss_alpha = aux_loss_alpha        # 辅助损失系数
+        self.seq_aux = seq_aux                      # 序列级辅助损失
+        self.norm_topk_prob = norm_topk_prob        # 归一化专家概率
 
-        # Linear Attention
-        self.use_linear_attn = use_linear_attn
+        # 混合注意力架构
+        self.use_linear_attn = use_linear_attn      # 是否启用混合注意力
         if layer_types is None:
             if use_linear_attn:
+                # 默认：每隔一层交替（可被 JSON 配置覆盖）
                 self.layer_types = ["linear_attention" if i % 2 == 1 else "attention"
                                     for i in range(n_layers)]
             else:
                 self.layer_types = ["attention"] * n_layers
         else:
-            self.layer_types = layer_types
-        self.conv_kernel_size = conv_kernel_size
+            self.layer_types = layer_types          # 从 JSON 配置加载的层类型列表
+        self.conv_kernel_size = conv_kernel_size    # 因果卷积核大小
 
 
 class TransformerBlock(nn.Module):
@@ -588,8 +635,11 @@ class MindLM(PreTrainedModel):
 
         if targets is not None:
             logits = self.output(h)
+            pad_id = getattr(self.config, 'pad_token_id', None)
+            if pad_id is None:
+                pad_id = self.config.vocab_size - 1
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                  ignore_index=0)
+                                  ignore_index=pad_id)
             if total_aux_loss > 0:
                 loss = loss + total_aux_loss
         else:
@@ -628,24 +678,22 @@ class MindLM(PreTrainedModel):
 
 
 if __name__ == "__main__":
+    # 推荐配置：MiniMind-Small规模 (~30M)
     config = MindLMConfig(
         dim=512,
         n_layers=8,
         n_heads=8,
-        vocab_size=10000,
+        vocab_size=6400,  # 使用MiniMind词表大小
+        # MoE配置：减小专家数
         use_moe=True,
-        n_routed_experts=8,
+        n_routed_experts=4,      # 从8降到4
         num_experts_per_tok=2,
         n_shared_experts=1,
         aux_loss_alpha=0.01,
+        # Linear Attention配置
         use_linear_attn=True,
-    )
-    config = MindLMConfig(
-        dim=512,
-        n_layers=8,
-        n_heads=8,
-        vocab_size=10000,
-        use_linear_attn=True        
+        # 混合架构：前4层Attention，后4层Linear
+        layer_types=["attention"]*4 + ["linear_attention"]*4,
     )
 
     model = MindLM(config)

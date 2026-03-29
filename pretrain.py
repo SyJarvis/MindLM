@@ -28,6 +28,7 @@ sys.path.insert(0, str(project_root))
 from transformers import AutoTokenizer
 from MindLM.modeling_mindlm import MindLM, MindLMConfig
 from MindLM.dataset import PretrainDataset
+from MindLM.config import load_config
 
 warnings.filterwarnings('ignore')
 
@@ -127,59 +128,42 @@ def train_epoch(epoch, wandb):
                     "step": global_step,
                 })
 
-        # 模型保存
+        # 定期保存（覆盖写，只保留最新）
         if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
-            save_checkpoint(epoch, step)
+            save_snapshot(epoch)
 
 
-def save_checkpoint(epoch, step):
-    """保存模型检查点"""
+def save_snapshot(epoch):
+    """定期保存模型快照（覆盖写，固定文件名）"""
     model.eval()
+    moe_path = '_moe' if config.use_moe else ''
+    linear_path = '_linear' if config.use_linear_attn else ''
+    ckpt_path = os.path.join(args.save_dir, f'mindlm_pretrain_{config.dim}{moe_path}{linear_path}.pth')
 
-    # 构建文件名
-    moe_tag = '_moe' if config.use_moe else ''
-    linear_tag = '_linear' if config.use_linear_attn else ''
-    ckp_name = f'mindlm_pretrain_{config.dim}{moe_tag}{linear_tag}_ep{epoch}_step{step}.pth'
-    ckp_path = os.path.join(args.save_dir, ckp_name)
-
-    # 获取状态字典
     if isinstance(model, DistributedDataParallel):
         state_dict = model.module.state_dict()
     else:
         state_dict = model.state_dict()
 
-    # 保存（包含config）
-    checkpoint = {
-        'model_state_dict': state_dict,
-        'config': {
-            'dim': config.dim,
-            'n_layers': config.n_layers,
-            'n_heads': config.n_heads,
-            'n_kv_heads': config.n_kv_heads,
-            'vocab_size': config.vocab_size,
-            'max_seq_len': config.max_seq_len,
-            'dropout': config.dropout,
-            'norm_eps': config.norm_eps,
-            'hidden_dim': config.hidden_dim,
-            'multiple_of': config.multiple_of,
-            'use_moe': config.use_moe,
-            'n_routed_experts': config.n_routed_experts,
-            'num_experts_per_tok': config.num_experts_per_tok,
-            'n_shared_experts': config.n_shared_experts,
-            'scoring_func': config.scoring_func,
-            'aux_loss_alpha': config.aux_loss_alpha,
-            'seq_aux': config.seq_aux,
-            'norm_topk_prob': config.norm_topk_prob,
-            'use_linear_attn': config.use_linear_attn,
-            'layer_types': config.layer_types,
-            'conv_kernel_size': config.conv_kernel_size,
-        },
-        'epoch': epoch,
-        'step': step,
-    }
+    torch.save(state_dict, ckpt_path)
+    Logger(f'💾 快照已保存: {ckpt_path}')
+    model.train()
 
-    torch.save(checkpoint, ckp_path)
-    Logger(f'💾 模型已保存: {ckp_path}')
+
+def save_checkpoint(epoch):
+    """每轮结束保存完整检查点（带 epoch 编号）"""
+    model.eval()
+    moe_path = '_moe' if config.use_moe else ''
+    linear_path = '_linear' if config.use_linear_attn else ''
+    ckpt_path = os.path.join(args.save_dir, f'mindlm_pretrain_{config.dim}{moe_path}{linear_path}_epoch{epoch}.pth')
+
+    if isinstance(model, DistributedDataParallel):
+        state_dict = model.module.state_dict()
+    else:
+        state_dict = model.state_dict()
+
+    torch.save(state_dict, ckpt_path)
+    Logger(f'💾 模型已保存: {ckpt_path}')
     model.train()
 
 
@@ -188,15 +172,17 @@ def init_model():
     def count_parameters(model):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    # 加载tokenizer（使用MiniMind的tokenizer）
-    tokenizer_path = args.tokenizer_path or str(project_root / 'model/minimind_tokenizer')
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    # 加载MindLM分词器
+    tokenizer_path = args.tokenizer_path or str(project_root / 'MindLM/mindlm_tokenizer')
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
-    # 确保vocab_size匹配
+    # 确保vocab_size和pad_token_id匹配
     if config.vocab_size != len(tokenizer):
         Logger(f'⚠️ 警告: config.vocab_size({config.vocab_size}) != tokenizer.vocab_size({len(tokenizer)})')
         Logger(f'自动调整为tokenizer.vocab_size')
         config.vocab_size = len(tokenizer)
+    if tokenizer.pad_token_id is not None:
+        config.pad_token_id = tokenizer.pad_token_id
 
     # 创建模型
     model = MindLM(config).to(args.device)
@@ -266,7 +252,7 @@ if __name__ == "__main__":
 
     # 基础配置
     parser.add_argument("--out_dir", type=str, default="out", help="输出目录")
-    parser.add_argument("--epochs", type=int, default=20, help="训练轮数")
+    parser.add_argument("--epochs", type=int, default=5, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=64, help="批次大小")
     parser.add_argument("--learning_rate", type=float, default=2e-4, help="学习率")
     parser.add_argument("--device", type=str,
@@ -275,48 +261,22 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", type=str, default="bfloat16",
                         choices=["float16", "bfloat16", "float32"],
                         help="数据类型")
-
+    parser.add_argument("--resume_from", type=str, default=None,
+                        help="续训权重路径")
+    parser.add_argument("--max_seq_len", type=int, default=None,
+                        help="最大序列长度（默认576，适合0.5B模型；1B模型建议1024）")
     # 数据配置
     parser.add_argument("--data_path", type=str,
-                        default=str(project_root / "dataset/pretrain_data.csv"),
+                        default="data/pretrain_data.csv",
                         help="训练数据路径")
     parser.add_argument("--tokenizer_path", type=str, default=None,
-                        help="Tokenizer路径（默认使用MiniMind tokenizer）")
+                        help="Tokenizer路径（默认使用MindLM分词器）")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="数据加载线程数")
-
+    
     # 模型架构配置
-    parser.add_argument("--dim", type=int, default=512, help="模型隐藏维度")
-    parser.add_argument("--n_layers", type=int, default=8, help="模型层数")
-    parser.add_argument("--n_heads", type=int, default=8, help="注意力头数")
-    parser.add_argument("--n_kv_heads", type=int, default=None,
-                        help="KV头数（None表示等于n_heads）")
-    parser.add_argument("--max_seq_len", type=int, default=512,
-                        help="最大序列长度")
-
-    # MoE配置
-    parser.add_argument("--use_moe", action="store_true", default=True,
-                        help="使用MoE")
-    parser.add_argument("--no_moe", action="store_true",
-                        help="禁用MoE")
-    parser.add_argument("--n_routed_experts", type=int, default=8,
-                        help="路由专家数量")
-    parser.add_argument("--num_experts_per_tok", type=int, default=2,
-                        help="每token选择的专家数")
-    parser.add_argument("--n_shared_experts", type=int, default=1,
-                        help="共享专家数")
-    parser.add_argument("--aux_loss_alpha", type=float, default=0.01,
-                        help="MoE辅助损失系数")
-
-    # Linear Attention配置
-    parser.add_argument("--use_linear_attn", action="store_true", default=True,
-                        help="使用Linear Attention")
-    parser.add_argument("--no_linear_attn", action="store_true",
-                        help="禁用Linear Attention（全部使用标准Attention）")
-    parser.add_argument("--conv_kernel_size", type=int, default=4,
-                        help="因果卷积核大小")
-    parser.add_argument("--layer_types", type=str, default=None,
-                        help='层类型配置，如: "attention,linear_attention,attention,..."')
+    parser.add_argument("--model_config", type=str, default="mindlm_0.5b",
+                        help="模型配置名， 从config目录加载json")
 
     # 训练优化配置
     parser.add_argument("--accumulation_steps", type=int, default=8,
@@ -336,6 +296,10 @@ if __name__ == "__main__":
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="分布式训练的local rank")
 
+    # 编译优化
+    parser.add_argument("--compile", action="store_true",
+                        help="启用torch.compile优化（默认关闭，可能导致编译卡住）")
+
     # wandb配置
     parser.add_argument("--use_wandb", action="store_true",
                         help="使用Weights & Biases记录训练")
@@ -345,12 +309,6 @@ if __name__ == "__main__":
                         help="wandb运行名称")
 
     args = parser.parse_args()
-
-    # 处理互斥参数
-    if args.no_moe:
-        args.use_moe = False
-    if args.no_linear_attn:
-        args.use_linear_attn = False
 
     # 创建输出目录
     args.save_dir = os.path.join(args.out_dir)
@@ -376,35 +334,41 @@ if __name__ == "__main__":
         args.device = torch.device(DEVICE)
 
     # 创建MindLM配置
-    # 解析layer_types
-    layer_types = None
-    if args.layer_types:
-        layer_types = [t.strip() for t in args.layer_types.split(",")]
+    if args.model_config:
+        # 从JSON配置文件加载模型架构
+        model_config_dict = load_config(args.model_config)
+        Logger(f'加载模型配置: config/{args.model_config}.json')
+        config = MindLMConfig(                                                                                                                    
+            dim=model_config_dict['dim'],                                                                                                         
+            n_layers=model_config_dict['n_layers'],                                                                                               
+            n_heads=model_config_dict['n_heads'],                                                                                                 
+            n_kv_heads=model_config_dict['n_kv_heads'],                                                                                           
+            vocab_size=model_config_dict['vocab_size'],                                                                                           
+            max_seq_len=model_config_dict['max_seq_len'],                                                                                         
+            dropout=model_config_dict.get('dropout', 0.0),                                                                                        
+            norm_eps=model_config_dict.get('norm_eps', 1e-6),                                                                                     
+            hidden_dim=model_config_dict.get('hidden_dim'),                                                                                       
+            multiple_of=model_config_dict.get('multiple_of', 256),                                                                                
+            use_moe=model_config_dict.get('use_moe', False),                                                                                      
+            n_routed_experts=model_config_dict.get('n_routed_experts', 4),                                                                        
+            num_experts_per_tok=model_config_dict.get('num_experts_per_tok', 2),                                                                  
+            n_shared_experts=model_config_dict.get('n_shared_experts', 1),                                                                        
+            scoring_func='softmax',                                                                                                               
+            aux_loss_alpha=model_config_dict.get('aux_loss_alpha', 0.01),                                                                         
+            seq_aux=True,                                                                                                                         
+            norm_topk_prob=True,                                                                                                                  
+            use_linear_attn=model_config_dict.get('use_linear_attn', True),                                                                       
+            layer_types=model_config_dict.get('layer_types'),                                                                                     
+            conv_kernel_size=model_config_dict.get('conv_kernel_size', 4),                                                                        
+        ) 
+    else:
+        Logger(f'加载默认模型配置: MindLMConfig')
+        config = MindLMConfig()
 
-    config = MindLMConfig(
-        dim=args.dim,
-        n_layers=args.n_layers,
-        n_heads=args.n_heads,
-        n_kv_heads=args.n_kv_heads,
-        vocab_size=10000,  # 会被tokenizer的实际大小覆盖
-        max_seq_len=args.max_seq_len,
-        dropout=0.0,
-        norm_eps=1e-6,
-        hidden_dim=None,
-        multiple_of=256,
-        use_moe=args.use_moe,
-        n_routed_experts=args.n_routed_experts,
-        num_experts_per_tok=args.num_experts_per_tok,
-        n_shared_experts=args.n_shared_experts,
-        scoring_func='softmax',
-        aux_loss_alpha=args.aux_loss_alpha,
-        seq_aux=True,
-        norm_topk_prob=True,
-        use_linear_attn=args.use_linear_attn,
-        layer_types=layer_types,
-        conv_kernel_size=args.conv_kernel_size,
-    )
-
+    if args.max_seq_len is not None:
+        config.max_seq_len = args.max_seq_len
+        Logger(f'⚡ 使用命令行指定的最大序列长度: {config.max_seq_len}')
+        
     # 打印架构信息
     print_architecture_info()
 
@@ -412,9 +376,9 @@ if __name__ == "__main__":
     if args.use_wandb and (not ddp or dist.get_rank() == 0):
         import wandb
         wandb_run_name = args.wandb_run_name or (
-            f"MindLM-D{args.dim}-L{args.n_layers}-H{args.n_heads}-"
-            f"MoE{args.n_routed_experts if args.use_moe else 0}-"
-            f"Linear{args.use_linear_attn}"
+            f"MindLM-D{config.dim}-L{config.n_layers}-H{config.n_heads}-"
+            f"MoE{config.n_routed_experts if config.use_moe else 0}-"
+            f"Linear{config.use_linear_attn}"
         )
         wandb.init(project=args.wandb_project, name=wandb_run_name, config=vars(args))
     else:
@@ -423,11 +387,21 @@ if __name__ == "__main__":
     # 初始化模型和tokenizer
     model, tokenizer = init_model()
 
+    # 加载续训权重
+    if args.resume_from:
+        Logger(f"加载续训权重: {args.resume_from}")
+        state_dict = torch.load(args.resume_from, map_location=args.device)
+        # 处理DDP的module，前缀
+        if any(k.startswith("module.") for k in state_dict.keys()):
+            state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict, strict=False)
+        Logger("续训权重加载成功!")
+
     # 加载数据
     Logger(f'📂 加载训练数据: {args.data_path}')
     df = pd.read_csv(args.data_path)
     df = df.sample(frac=1.0)  # 打乱
-    train_ds = PretrainDataset(df, tokenizer, max_length=args.max_seq_len)
+    train_ds = PretrainDataset(df, tokenizer, max_length=config.max_seq_len)
 
     # 创建DataLoader
     train_sampler = DistributedSampler(train_ds) if ddp else None
@@ -444,11 +418,12 @@ if __name__ == "__main__":
     Logger(f'📊 数据集大小: {len(train_ds)}, 批次数量: {len(train_loader)}')
 
     # 优化器和梯度缩放器
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
+    # bfloat16 不需要 GradScaler，只有 float16 需要
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.1)
 
     # torch.compile加速（Linux + PyTorch 2.0+）
-    if platform.system() != 'Windows' and float(torch.__version__.split('.')[0]) >= 2:
+    if args.compile and platform.system() != 'Windows' and float(torch.__version__.split('.')[0]) >= 2:
         Logger("⚡ 启用torch.compile优化...")
         model = torch.compile(model)
 
@@ -467,7 +442,7 @@ if __name__ == "__main__":
 
         # 每轮结束后保存
         if not ddp or dist.get_rank() == 0:
-            save_checkpoint(epoch, iter_per_epoch - 1)
+            save_checkpoint(epoch)
 
     Logger('✅ 训练完成!')
 

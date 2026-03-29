@@ -2,8 +2,8 @@
 
 <div align="center">
 
-<h2>🧠 MindLM: 混合架构语言模型</h2>
-<p><b>基于 MiniMind 的 Linear Attention + MoE 扩展</b></p>
+<h2>MindLM: 混合架构语言模型</h2>
+<p><b>Linear Attention + MoE 混合架构语言模型</b></p>
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange)
@@ -15,36 +15,32 @@
 
 ## 📋 项目简介
 
-**MindLM** 是基于 [MiniMind](https://github.com/jingyaogong/minimind) 开发的扩展项目，引入了 **Linear Attention** 和 **混合架构** 设计，旨在探索更高效的注意力机制与稀疏专家模型的结合。
+**MindLM** 是一个采用 **Linear Attention** 与 **混合架构** 设计的语言模型，旨在探索更高效的注意力机制与稀疏专家模型的结合。
 
 ### 核心特性
 
 - ✅ **混合架构**: 标准 Attention (O(n²)) + Linear Attention (O(n)) 自由组合
 - ✅ **稀疏专家 (MoE)**: Top-K 路由 + 共享专家机制
 - ✅ **线性复杂度**: Gated DeltaNet 实现线性注意力，大幅降低长序列计算开销
-- ✅ **灵活配置**: 支持层级别自定义，按需组合不同注意力类型
-- ✅ **兼容 MiniMind**: 沿用 MiniMind 的数据集、Tokenizer 和训练流程
+- ✅ **灵活配置**: JSON 配置文件驱动，支持层级别自定义，按需组合不同注意力类型
 
 ---
 
-## 🆚 MindLM vs MiniMind 对比
+## 🆚 MindLM 架构特点
 
-| 特性 | **MiniMind** | **MindLM** |
-|------|-------------|-----------|
-| **注意力类型** | 标准 Multi-Head Attention | 混合：标准 Attention + Linear Attention |
-| **计算复杂度** | O(n²) | O(n²) / O(n) 可选 |
-| **长序列支持** | 有限（内存瓶颈） | 优秀（Linear Attention） |
-| **MoE支持** | ✅ 有 | ✅ 有（增强版） |
-| **架构灵活性** | 固定 | 层级别自定义 |
-| **3D RoPE** | ❌ 无 | ✅ 支持（可选扩展） |
-| **门控机制** | 简单 | Gated DeltaNet |
+| 特性 | **MindLM** |
+|------|-----------|
+| **注意力类型** | 混合：标准 Attention + Linear Attention |
+| **计算复杂度** | O(n²) / O(n) 可选 |
+| **长序列支持** | 优秀（Linear Attention） |
+| **MoE支持** | Top-K 路由 + 共享专家 |
+| **架构灵活性** | 层级别自定义 |
+| **GQA** | Grouped Query Attention，降低 KV-Cache 开销 |
+| **门控机制** | Gated DeltaNet |
 
-### 架构差异详解
+### 架构示意
 
 ```
-MiniMind Layer:
-  Input → RMSNorm → Attention (O(n²)) → + → RMSNorm → MoE/FFN → + → Output
-
 MindLM Layer (混合):
   Input → RMSNorm → Attention/LinearAttn → + → RMSNorm → MoE/FFN → + → Output
                   (根据配置自动选择)
@@ -83,64 +79,34 @@ Top-K Router → Expert Selection → Parallel Computation → Weighted Sum
              Shared Expert (全局)
 ```
 
-### 2. 架构配置示例
+### 2. 架构配置
 
-#### 配置A: 标准MiniMind（对比基准）
-```python
-layer_types = ["attention"] * 8  # 8层标准Attention
-use_moe = True                   # 启用MoE
+项目通过 JSON 配置文件定义模型架构，位于 `config/` 目录：
+
+| 配置文件 | 参数量 | 隐藏维度 | 层数 | Linear Attn | 标准Attn | 序列长度 |
+|---------|--------|---------|------|------------|---------|---------|
+| `mindlm_0.5b.json` | 43.6M | 576 | 12 | 8 层 | 4 层 | 512 |
+| `mindlm_1b.json` | 95.3M | 768 | 16 | 12 层 | 4 层 | 1024 |
+
+以 `mindlm_1b.json` 为例：
+
+```json
+{
+    "dim": 768,
+    "n_layers": 16,
+    "n_heads": 12,
+    "n_kv_heads": 3,
+    "use_moe": false,
+    "use_linear_attn": true,
+    "max_seq_len": 1024,
+    "layer_types": [
+        "linear_attention", "linear_attention", "linear_attention", "attention",
+        "linear_attention", "linear_attention", "linear_attention", "attention",
+        "linear_attention", "linear_attention", "linear_attention", "attention",
+        "linear_attention", "linear_attention", "linear_attention", "attention"
+    ]
+}
 ```
-
-#### 配置B: 全Linear Attention（效率优先）
-```python
-layer_types = ["linear_attention"] * 8  # 8层Linear Attention
-use_moe = True                          # 启用MoE
-```
-
-#### 配置C: 混合架构（推荐）⭐
-```python
-layer_types = ["attention", "linear_attention"] * 4  # 交替使用
-# 结果: [attn, linear, attn, linear, attn, linear, attn, linear]
-use_moe = True
-```
-
-#### 配置D: 分层策略（先理解后扩展）
-```python
-layer_types = [
-    "attention",        # L0: 全局理解
-    "attention",        # L1: 局部特征
-    "linear_attention", # L2: 高效处理
-    "linear_attention", # L3: 高效处理
-    "linear_attention", # L4: 高效处理
-    "linear_attention", # L5: 高效处理
-    "attention",        # L6: 重新聚合
-    "attention",        # L7: 输出稳定
-]
-```
-
----
-
-## 📊 模型大小与性能
-
-### 参数规模对比
-
-| 模型配置 | 隐藏维度 | 层数 | 参数量 | 激活参数量 | 推理内存 |
-|---------|---------|------|--------|-----------|---------|
-| MindLM-Small | 512 | 8 | ~85M | ~26M | ~0.8 GB |
-| MindLM-Small-MoE | 512 | 8 | ~120M | ~35M | ~1.0 GB |
-| MindLM-Base | 768 | 16 | ~260M | ~85M | ~1.8 GB |
-| MindLM-Base-MoE | 768 | 16 | ~380M | ~110M | ~2.2 GB |
-
-*注：激活参数量指推理时实际参与计算的专家参数。*
-
-### 序列长度扩展性
-
-| 序列长度 | MiniMind (O(n²)) | MindLM Linear (O(n)) | 加速比 |
-|---------|------------------|---------------------|--------|
-| 512 | 1x | 0.9x | ~1x |
-| 2048 | 1x | 1.2x | 1.2x |
-| 8192 | 1x | 2.5x | 2.5x |
-| 32768 | OOM | 1x | ∞ |
 
 ---
 
@@ -150,10 +116,10 @@ layer_types = [
 
 ```bash
 # 克隆项目
-git clone https://github.com/jingyaogong/minimind.git
-cd minimind
+git clone <repo-url>
+cd MindLM
 
-# 安装依赖（沿用MiniMind环境）
+# 安装依赖
 pip install -r requirements.txt
 
 # 验证PyTorch
@@ -162,83 +128,75 @@ python -c "import torch; print(torch.__version__); print(torch.cuda.is_available
 
 ### 基础训练
 
-#### 1. 混合架构训练（推荐）
+#### 1. MindLM-0.5B 训练（单卡 RTX 4090 即可）
 
 ```bash
 python pretrain.py \
-    --epochs 20 \
+    --model_config mindlm_0.5b \
     --batch_size 64 \
-    --learning_rate 2e-4 \
-    --dim 512 \
-    --n_layers 8 \
-    --n_heads 8 \
-    --use_moe \
-    --use_linear_attn
+    --epochs 5 \
+    --accumulation_steps 8
 ```
 
-#### 2. 纯标准Attention（对比）
+- 参数量：43.6M（隐藏维度 576，12 层，9 头）
+- 层类型：8 层 Linear Attention + 4 层标准 Attention
+- 序列长度：512
+- 训练数据：536 万条样本，每轮 83827 次迭代
+- 硬件需求：单张 RTX 4090，batch_size=64
+
+#### 2. MindLM-1B 训练
 
 ```bash
 python pretrain.py \
-    --epochs 20 \
-    --dim 512 \
-    --n_layers 8 \
-    --use_moe \
-    --no_linear_attn    # 禁用Linear Attention
+    --model_config mindlm_1b \
+    --batch_size 64 \
+    --epochs 3 \
+    --accumulation_steps 8
 ```
 
-#### 3. 纯Linear Attention（效率）
+- 参数量：95.3M（隐藏维度 768，16 层，12 头）
+- 层类型：12 层 Linear Attention + 4 层标准 Attention
+- 序列长度：1024
+- 训练数据：536 万条样本，每轮 33531 次迭代
 
-```bash
-python pretrain.py \
-    --epochs 20 \
-    --dim 512 \
-    --n_layers 8 \
-    --use_moe \
-    --layer_types "linear_attention,linear_attention,linear_attention,linear_attention,linear_attention,linear_attention,linear_attention,linear_attention"
-```
-
-#### 4. 分布式训练
+#### 3. 分布式训练
 
 ```bash
 # 单机多卡
-torchrun --nproc_per_node 2 pretrain.py \
+torchrun --nproc_per_node=2 pretrain.py \
+    --model_config mindlm_1b \
+    --batch_size 80 \
+    --accumulation_steps 2 \
+    --epochs 3 \
     --ddp \
-    --epochs 20 \
-    --batch_size 32
+    --num_workers 8
 ```
 
 ### 模型推理
 
+```bash
+# 快速评估预训练模型
+cd examples
+python eval_pretrain.py
+```
+
 ```python
+# 自定义推理（精简版）
 from modeling_mindlm import MindLM, MindLMConfig
+from config import load_config
 import torch
+from transformers import AutoTokenizer
 
-# 加载配置和模型
-config = MindLMConfig(
-    dim=512,
-    n_layers=8,
-    use_moe=True,
-    use_linear_attn=True,
-)
+config = MindLMConfig(**load_config("mindlm_1b"))
 model = MindLM(config)
-
-# 加载训练好的权重
-checkpoint = torch.load("out/mindlm_pretrain_512_moe_linear_ep19_final.pth")
-model.load_state_dict(checkpoint['model_state_dict'])
+model.load_state_dict(torch.load("out/mindlm_pretrain_768_linear_epoch0.pth", map_location="cpu", weights_only=True))
 model.eval()
 
-# 生成文本
-from transformers import AutoTokenizer
-tokenizer = AutoTokenizer.from_pretrained("../model/minimind_tokenizer")
-
-prompt = "人工智能的发展"
-input_ids = tokenizer.encode(prompt, return_tensors="pt")
-
+tokenizer = AutoTokenizer.from_pretrained("mindlm_tokenizer", trust_remote_code=True)
+input_ids = tokenizer.encode("人工智能的发展", return_tensors="pt")
 with torch.no_grad():
-    for generated in model.generate(input_ids, eos=0, max_new_tokens=100):
-        output_text = tokenizer.decode(generated[0])
-        print(output_text)
+    for out in model.generate(input_ids, eos=0, max_new_tokens=100):
+        print(tokenizer.decode(out[0], skip_special_tokens=True))
 ```
 
 ---
@@ -252,18 +210,18 @@ from modeling_mindlm import MindLMConfig
 
 config = MindLMConfig(
     # ===== 基础架构 =====
-    dim=512,                    # 隐藏层维度
-    n_layers=8,                 # 层数
-    n_heads=8,                  # 注意力头数
-    n_kv_heads=None,            # KV头数（None=等于n_heads）
-    vocab_size=10000,           # 词表大小（会被tokenizer覆盖）
-    max_seq_len=512,            # 最大序列长度
+    dim=768,                    # 隐藏层维度
+    n_layers=16,                # 层数
+    n_heads=12,                 # 注意力头数
+    n_kv_heads=3,               # KV头数（GQA，降低KV-Cache开销）
+    vocab_size=6400,            # 词表大小（会被tokenizer覆盖）
+    max_seq_len=1024,           # 最大序列长度
     dropout=0.0,                # Dropout率
     norm_eps=1e-6,              # RMSNorm epsilon
 
     # ===== MoE配置 =====
-    use_moe=True,               # 启用MoE
-    n_routed_experts=8,         # 路由专家数量
+    use_moe=False,              # 启用MoE（默认关闭）
+    n_routed_experts=4,         # 路由专家数量
     num_experts_per_tok=2,      # 每token选择专家数
     n_shared_experts=1,         # 共享专家数
     scoring_func='softmax',     # 路由评分函数
@@ -282,23 +240,18 @@ config = MindLMConfig(
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--dim` | int | 512 | 隐藏层维度 |
-| `--n_layers` | int | 8 | 层数 |
-| `--n_heads` | int | 8 | 注意力头数 |
-| `--use_moe` | bool | True | 启用MoE |
-| `--n_routed_experts` | int | 8 | 路由专家数 |
-| `--num_experts_per_tok` | int | 2 | 每token选择专家数 |
-| `--use_linear_attn` | bool | True | 启用Linear Attention |
-| `--layer_types` | str | None | 层类型配置（逗号分隔） |
-| `--conv_kernel_size` | int | 4 | 因果卷积核大小 |
-| `--epochs` | int | 20 | 训练轮数 |
+| `--model_config` | str | "mindlm_0.5b" | 模型配置名，从 config/ 目录加载 JSON |
+| `--epochs` | int | 5 | 训练轮数 |
 | `--batch_size` | int | 64 | 批次大小 |
 | `--learning_rate` | float | 2e-4 | 学习率 |
 | `--accumulation_steps` | int | 8 | 梯度累积步数 |
 | `--grad_clip` | float | 1.0 | 梯度裁剪阈值 |
 | `--warmup_iters` | int | 100 | Warmup步数 |
+| `--data_path` | str | "data/pretrain_data.csv" | 训练数据路径 |
+| `--tokenizer_path` | str | None | Tokenizer路径 |
 | `--dtype` | str | "bfloat16" | 数据类型 |
 | `--ddp` | bool | False | 启用分布式训练 |
+| `--compile` | bool | False | 启用torch.compile优化 |
 | `--use_wandb` | bool | False | 启用wandb记录 |
 
 ---
@@ -308,6 +261,10 @@ config = MindLMConfig(
 ```
 .
 ├── README.md                 # 本文件
+├── config.py                 # 配置加载工具
+├── config/                   # 模型配置文件
+│   ├── mindlm_0.5b.json      # MindLM-0.5B 配置
+│   └── mindlm_1b.json        # MindLM-1B 配置
 ├── modeling_mindlm.py        # MindLM模型实现
 │   ├── MindLMConfig          # 配置类
 │   ├── Attention             # 标准Attention
@@ -317,11 +274,17 @@ config = MindLMConfig(
 │   └── MindLM                # 主模型
 │
 ├── pretrain.py               # 预训练脚本
-├── dataset.py                # 数据集（沿用MiniMind）
+├── dataset.py                # 数据集
+├── train_tokenizer.py        # Tokenizer训练脚本
+│
+├── mindlm_tokenizer/         # 自定义Tokenizer
+├── data/                     # 训练数据目录
+├── examples/                 # 示例脚本
+│   └── eval_pretrain.py      # 预训练模型评估/推理
+├── docs/                     # 技术文档
 │
 └── out/                      # 输出目录
-    ├── mindlm_pretrain_*.pth    # 预训练权重
-    └── mindlm_sft_*.pth         # SFT权重
+    └── mindlm_pretrain_*.pth # 预训练权重
 ```
 
 ---
@@ -358,38 +321,15 @@ aux_loss = config.aux_loss_alpha * torch.sum(tokens_per_expert * router_prob_per
 
 ## 📈 训练建议
 
-### 1. 从MiniMind迁移
-
-如果你有MiniMind的训练经验，迁移到MindLM非常简单：
-
-```python
-# MiniMind
-from model.model import Transformer
-from model.LMConfig import LMConfig
-
-# MindLM
-from modeling_mindlm import MindLM, MindLMConfig
-
-# 配置几乎相同，只是多了几个参数
-config = MindLMConfig(
-    dim=512,
-    n_layers=8,
-    use_moe=True,
-    use_linear_attn=True,  # 新增
-)
-```
-
-### 2. 超参数调优
+### 1. 超参数调优
 
 | 场景 | 推荐配置 |
 |------|---------|
-| **短文本(<1K)** | 全Attention，`layer_types=["attention"]*8` |
-| **长文本(>4K)** | 全Linear，`layer_types=["linear_attention"]*8` |
-| **通用任务** | 混合架构，`use_linear_attn=True`（默认交替） |
-| **资源受限** | 小模型+全Linear，`dim=384, n_layers=6` |
-| **高性能** | 大模型+混合，`dim=768, n_layers=16, n_routed_experts=16` |
+| **快速验证** | `mindlm_0.5b`（43.6M，训练快） |
+| **标准训练** | `mindlm_1b`（95.3M，效果好） |
+| **长文本** | 修改配置中 `max_seq_len`，增加 Linear Attention 层比例 |
 
-### 3. 学习率调度
+### 2. 学习率调度
 
 ```python
 # Warmup + Cosine Decay
@@ -406,40 +346,73 @@ min_lr = init_lr / 10
 
 ## 🧪 实验对比
 
-### 训练效率对比（相同硬件：RTX 3090）
+### 序列长度扩展性
 
-| 模型 | 参数量 | Batch Size | 迭代速度 | 显存占用 |
-|------|--------|-----------|---------|---------|
-| MiniMind-26M | 26M | 64 | 100 it/s | 8 GB |
-| MindLM-85M (混合) | 85M | 48 | 85 it/s | 10 GB |
-| MindLM-85M (全Linear) | 85M | 64 | 95 it/s | 9 GB |
-
-*注：实际速度取决于序列长度和具体配置。*
+| 序列长度 | 标准 Attention (O(n²)) | Linear Attention (O(n)) |
+|---------|----------------------|------------------------|
+| 512 | 1x | ~0.9x |
+| 2048 | 1x | ~1.2x |
+| 8192 | 1x | ~2.5x |
+| 32768 | OOM | 可处理 |
 
 ### 下游任务性能（待补充）
 
-| 任务 | MiniMind | MindLM-混合 | MindLM-全Linear |
-|------|---------|------------|----------------|
-| 文本续写 | - | - | - |
-| 问答任务 | - | - | - |
-| 长文本理解 | OOM | ✅ | ✅✅ |
+| 任务 | MindLM-混合 | MindLM-全Linear |
+|------|------------|----------------|
+| 文本续写 | - | - |
+| 问答任务 | - | - |
+| 长文本理解 | ✅ | ✅✅ |
 
 ---
 
-## 🤝 与MiniMind的兼容性
+## ⚠️ 注意事项
 
-### ✅ 完全兼容
+1. **预训练 vs 对话**: 预训练模型用于文本续写，做对话需要先进行 SFT 微调
 
-- **Tokenizer**: 沿用 `minimind_tokenizer`
-- **数据集格式**: 相同CSV格式
-- **训练脚本**: 参数和用法类似
-- **推理API**: 相同的 `generate()` 方法
+---
 
-### ⚠️ 注意事项
+## 🆚 与 MiniMind 架构对比
 
-1. **权重不兼容**: MiniMind和MindLM的权重不能互换
-2. **配置文件**: MindLM使用 `MindLMConfig` 而非 `LMConfig`
-3. **推理速度**: Linear Attention层在短序列可能略慢
+| 特性 | **MiniMind** | **MindLM** |
+|------|-------------|-----------|
+| **注意力机制** | 标准 Multi-Head Attention | 混合：标准 Attention + Gated DeltaNet Linear Attention |
+| **计算复杂度** | O(n²) | O(n²) / O(n) 混合，长序列更高效 |
+| **KV-Cache** | MHA，KV头数=Query头数 | GQA，KV头数=3，显存占用更低 |
+| **长序列支持** | 有限（O(n²) 内存瓶颈） | 优秀（Linear Attention 层 O(n) 复杂度） |
+| **架构灵活性** | 固定全 Attention | 层级别自定义，支持任意组合 |
+| **位置编码** | RoPE | RoPE（标准层）+ Causal Conv1D（线性层） |
+| **门控机制** | 无 | Gated DeltaNet（decay gate + beta gate） |
+| **配置方式** | Python 代码 | JSON 配置文件，便于管理和复现 |
+
+### 架构对比示意
+
+```
+MiniMind Layer:
+  Input → RMSNorm → Attention (O(n²)) → + → RMSNorm → FFN → + → Output
+
+MindLM Layer:
+  Input → RMSNorm → Attention/LinearAttn → + → RMSNorm → FFN → + → Output
+                  (根据 layer_types 配置自动选择)
+
+  标准 Attention 层: RoPE + GQA → O(n²)
+  Linear Attention 层: Causal Conv1D + Gated DeltaNet → O(n)
+```
+
+### 典型配置对比
+
+```
+MiniMind (8层):
+  [Attention, Attention, Attention, Attention,
+   Attention, Attention, Attention, Attention]
+
+MindLM-0.5B (12层):
+  [Linear, Linear, Attention, Linear, Linear, Attention,
+   Linear, Linear, Attention, Linear, Linear, Attention]
+
+MindLM-1B (16层):
+  [Linear, Linear, Linear, Attention, Linear, Linear, Linear, Attention,
+   Linear, Linear, Linear, Attention, Linear, Linear, Linear, Attention]
+```
 
 ---
 
@@ -460,9 +433,9 @@ min_lr = init_lr / 10
 
 ## 🙏 致谢
 
-- 本项目基于 [MiniMind](https://github.com/jingyaogong/minimind) 开发
-- Linear Attention参考 [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention)
-- Gated DeltaNet参考 [TransformerEngine](https://github.com/NVIDIA/TransformerEngine)
+- 训练数据集和 Tokenizer 来自 [MiniMind](https://github.com/jingyaogong/minimind)，感谢其开源贡献
+- Linear Attention 参考 [Flash Linear Attention](https://github.com/fla-org/flash-linear-attention)
+- Gated DeltaNet 参考 [TransformerEngine](https://github.com/NVIDIA/TransformerEngine)
 
 ---
 
