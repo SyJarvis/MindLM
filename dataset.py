@@ -53,7 +53,8 @@ class SFTDataset(Dataset):
         self.tokenizer = tokenizer
         self.padding = tokenizer.pad_token_id
         # 兼容 Qwen2.5 的 <|im_start|>assistant 格式
-        self.bos_id = self.tokenizer('<|im_start|>assistant').data['input_ids']
+        # self.bos_id = self.tokenizer('<|im_start|>assistant').data['input_ids']
+        self.bos_id = self.tokenizer('<s>assistant\n', add_special_tokens=False).data['input_ids']
 
     def __len__(self):
         return self.df.shape[0]
