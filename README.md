@@ -116,7 +116,7 @@ Top-K Router → Expert Selection → Parallel Computation → Weighted Sum
 
 ```bash
 # 克隆项目
-git clone <repo-url>
+git clone https://github.com/SyJarvis/MindLM.git
 cd MindLM
 
 # 安装依赖
@@ -279,8 +279,10 @@ config = MindLMConfig(
 │
 ├── mindlm_tokenizer/         # 自定义Tokenizer
 ├── data/                     # 训练数据目录
-├── examples/                 # 示例脚本
+├── eval/                     # 模型推理
 │   └── eval_pretrain.py      # 预训练模型评估/推理
+├── examples/                 # 示例脚本
+│   └── load_tokenizer.py      # 使用分词器
 ├── docs/                     # 技术文档
 │
 └── out/                      # 输出目录
@@ -423,9 +425,9 @@ MindLM-1B (16层):
 ```bibtex
 @software{mindlm2024,
   title = {MindLM: Hybrid Architecture Language Model},
-  author = {Your Name},
-  year = {2024},
-  url = {https://github.com/yourusername/mindlm}
+  author = {Runke Zhong},
+  year = {2026},
+  url = {https://github.com/SyJarvis/MindLM}
 }
 ```
 
