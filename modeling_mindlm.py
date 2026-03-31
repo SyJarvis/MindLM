@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional, Tuple
-from transformers import PreTrainedModel, PretrainedConfig
+from transformers import PreTrainedModel, PretrainedConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
@@ -144,8 +144,8 @@ class GatedDeltaNet(nn.Module):
         self.num_heads = args.n_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.num_k_heads = getattr(args, 'n_kv_heads', None) or args.n_heads
-        self.num_v_heads = getattr(args, 'n_kv_heads', None) or args.n_heads
+        self.num_k_heads = getattr(args, 'linear_attn_heads', None) or args.n_heads
+        self.num_v_heads = getattr(args, 'linear_attn_heads', None) or args.n_heads
         self.head_k_dim = self.head_dim
         self.head_v_dim = self.head_dim
 
@@ -454,6 +454,7 @@ class MindLMConfig(PretrainedConfig):
         n_layers: int = 8,                # Transformer 层数（如 12=0.5B, 16=1B）
         n_heads: int = 8,                 # 查询注意力头数（Q heads）
         n_kv_heads: int = None,           # KV头数，None表示等于n_heads；设为更小值启用GQA（如3=4:1比例）
+        linear_attn_heads: int = None,     # 线性注意力头数，None表示等于n_heads；设为更小值启用线性注意力（如4=4:4比例）
         # ========== 词表与上下文 ==========
         vocab_size: int = 6400,           # 分词器词表大小
         max_seq_len: int = 512,         # 最大序列长度（0.5B=512, 1B=1024）
@@ -485,6 +486,7 @@ class MindLMConfig(PretrainedConfig):
         self.n_layers = n_layers          # Transformer 层数
         self.n_heads = n_heads            # Q 注意力头数
         self.n_kv_heads = n_kv_heads      # KV 注意力头数（GQA）
+        self.linear_attn_heads = linear_attn_heads
         self.vocab_size = vocab_size      # 词表大小
         self.max_seq_len = max_seq_len    # 最大序列长度
         self.dropout = dropout            # Dropout
@@ -513,6 +515,7 @@ class MindLMConfig(PretrainedConfig):
                 self.layer_types = ["attention"] * n_layers
         else:
             self.layer_types = layer_types          # 从 JSON 配置加载的层类型列表
+        self.tie_word_embeddings = True         # tok_embeddings 和 output 共享权重
         self.conv_kernel_size = conv_kernel_size    # 因果卷积核大小
 
 
@@ -563,9 +566,10 @@ class TransformerBlock(nn.Module):
             return out, None
 
 
-class MindLM(PreTrainedModel):
+class MindLM(PreTrainedModel, GenerationMixin):
     """MindLM主模型"""
     config_class = MindLMConfig
+    _tied_weights_keys = {"output.weight": "tok_embeddings.weight"}
 
     def __init__(self, config: MindLMConfig = None):
         if config is None:
@@ -603,6 +607,7 @@ class MindLM(PreTrainedModel):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
 
         self.aux_loss = 0.0
+        self.post_init()
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -611,6 +616,14 @@ class MindLM(PreTrainedModel):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def mark_tied_weights_as_initialized(self, loading_info):
+        """覆写父类方法：只标记已初始化，不从 missing_keys 中移除绑定权重。
+        transformers 5.3.0 的实现会移除 remote code 模型的绑定权重，
+        导致 tie_weights 误判两个权重都"存在"而拒绝绑定。"""
+        for tied_param in self.all_tied_weights_keys.keys():
+            param = self.get_parameter(tied_param)
+            param._is_hf_initialized = True
 
     def forward(self, tokens=None, targets=None, **kwargs):
         if 'input_ids' in kwargs:

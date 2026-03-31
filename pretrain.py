@@ -386,7 +386,7 @@ if __name__ == "__main__":
 
     # 初始化模型和tokenizer
     model, tokenizer = init_model()
-
+    exit(0)
     # 加载续训权重
     if args.resume_from:
         Logger(f"加载续训权重: {args.resume_from}")

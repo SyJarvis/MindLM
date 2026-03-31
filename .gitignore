@@ -1,0 +1,7 @@
+/model/__pycache__
+/dataset
+/wandb
+/out
+__pycache__/
+.DS_Store
+out/

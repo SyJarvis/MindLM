@@ -26,7 +26,7 @@
 
 ---
 
-## 🆚 MindLM 架构特点
+## MindLM 架构特点
 
 | 特性 | **MindLM** |
 |------|-----------|
@@ -85,10 +85,10 @@ Top-K Router → Expert Selection → Parallel Computation → Weighted Sum
 
 | 配置文件 | 参数量 | 隐藏维度 | 层数 | Linear Attn | 标准Attn | 序列长度 |
 |---------|--------|---------|------|------------|---------|---------|
-| `mindlm_0.5b.json` | 43.6M | 576 | 12 | 8 层 | 4 层 | 512 |
-| `mindlm_1b.json` | 95.3M | 768 | 16 | 12 层 | 4 层 | 1024 |
+| `mindlm_0.04b.json` | 43.6M | 576 | 12 | 8 层 | 4 层 | 512 |
+| `mindlm_0.1b.json` | 95.3M | 768 | 16 | 12 层 | 4 层 | 1024 |
 
-以 `mindlm_1b.json` 为例：
+以 `mindlm_0.1b.json` 为例：
 
 ```json
 {
@@ -128,11 +128,11 @@ python -c "import torch; print(torch.__version__); print(torch.cuda.is_available
 
 ### 基础训练
 
-#### 1. MindLM-0.5B 训练（单卡 RTX 4090 即可）
+#### 1. MindLM-0.04B 训练（单卡 RTX 4090 即可）
 
 ```bash
 python pretrain.py \
-    --model_config mindlm_0.5b \
+    --model_config mindlm_0.04b \
     --batch_size 64 \
     --epochs 5 \
     --accumulation_steps 8
@@ -144,11 +144,11 @@ python pretrain.py \
 - 训练数据：536 万条样本，每轮 83827 次迭代
 - 硬件需求：单张 RTX 4090，batch_size=64
 
-#### 2. MindLM-1B 训练
+#### 2. MindLM-0.1B 训练
 
 ```bash
 python pretrain.py \
-    --model_config mindlm_1b \
+    --model_config mindlm_0.1b \
     --batch_size 64 \
     --epochs 3 \
     --accumulation_steps 8
@@ -164,7 +164,7 @@ python pretrain.py \
 ```bash
 # 单机多卡
 torchrun --nproc_per_node=2 pretrain.py \
-    --model_config mindlm_1b \
+    --model_config mindlm_0.1b \
     --batch_size 80 \
     --accumulation_steps 2 \
     --epochs 3 \
@@ -187,7 +187,7 @@ from config import load_config
 import torch
 from transformers import AutoTokenizer
 
-config = MindLMConfig(**load_config("mindlm_1b"))
+config = MindLMConfig(**load_config("mindlm_0.1b"))
 model = MindLM(config)
 model.load_state_dict(torch.load("out/mindlm_pretrain_768_linear_epoch0.pth", map_location="cpu", weights_only=True))
 model.eval()
@@ -240,7 +240,7 @@ config = MindLMConfig(
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--model_config` | str | "mindlm_0.5b" | 模型配置名，从 config/ 目录加载 JSON |
+| `--model_config` | str | "mindlm_0.04b" | 模型配置名，从 config/ 目录加载 JSON |
 | `--epochs` | int | 5 | 训练轮数 |
 | `--batch_size` | int | 64 | 批次大小 |
 | `--learning_rate` | float | 2e-4 | 学习率 |
@@ -263,8 +263,8 @@ config = MindLMConfig(
 ├── README.md                 # 本文件
 ├── config.py                 # 配置加载工具
 ├── config/                   # 模型配置文件
-│   ├── mindlm_0.5b.json      # MindLM-0.5B 配置
-│   └── mindlm_1b.json        # MindLM-1B 配置
+│   ├── mindlm_0.04b.json      # MindLM-0.04B 配置
+│   └── mindlm_0.1b.json        # MindLM-0.1B 配置
 ├── modeling_mindlm.py        # MindLM模型实现
 │   ├── MindLMConfig          # 配置类
 │   ├── Attention             # 标准Attention
@@ -327,8 +327,8 @@ aux_loss = config.aux_loss_alpha * torch.sum(tokens_per_expert * router_prob_per
 
 | 场景 | 推荐配置 |
 |------|---------|
-| **快速验证** | `mindlm_0.5b`（43.6M，训练快） |
-| **标准训练** | `mindlm_1b`（95.3M，效果好） |
+| **快速验证** | `mindlm_0.04b`（43.6M，训练快） |
+| **标准训练** | `mindlm_0.1b`（95.3M，效果好） |
 | **长文本** | 修改配置中 `max_seq_len`，增加 Linear Attention 层比例 |
 
 ### 2. 学习率调度
@@ -407,11 +407,11 @@ MiniMind (8层):
   [Attention, Attention, Attention, Attention,
    Attention, Attention, Attention, Attention]
 
-MindLM-0.5B (12层):
+MindLM-0.04B (12层):
   [Linear, Linear, Attention, Linear, Linear, Attention,
    Linear, Linear, Attention, Linear, Linear, Attention]
 
-MindLM-1B (16层):
+MindLM-0.1B (16层):
   [Linear, Linear, Linear, Attention, Linear, Linear, Linear, Attention,
    Linear, Linear, Linear, Attention, Linear, Linear, Linear, Attention]
 ```
