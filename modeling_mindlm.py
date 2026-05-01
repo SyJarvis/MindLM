@@ -7,6 +7,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as cp
 from typing import List, Optional, Tuple
 from transformers import PreTrainedModel, PretrainedConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -479,6 +480,8 @@ class MindLMConfig(PretrainedConfig):
                                           # 推荐每4层一个标准attention（如1B: 12线性+4标准）
         # ========== GatedDeltaNet 特定参数 ==========
         conv_kernel_size: int = 4,        # 因果卷积核大小，提供局部位置感知，替代位置编码
+        # ========== 训练优化 ==========
+        gradient_checkpointing: str = 'off',  # 梯度检查点策略：'off'=关闭，'linear_attn'=仅linear层，'all'=所有层
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -517,12 +520,14 @@ class MindLMConfig(PretrainedConfig):
             self.layer_types = layer_types          # 从 JSON 配置加载的层类型列表
         self.tie_word_embeddings = True         # tok_embeddings 和 output 共享权重
         self.conv_kernel_size = conv_kernel_size    # 因果卷积核大小
+        self.gradient_checkpointing = gradient_checkpointing  # 梯度检查点策略
 
 
 class TransformerBlock(nn.Module):
     """MindLM Transformer块"""
     def __init__(self, layer_id: int, args: MindLMConfig):
         super().__init__()
+        self.args = args
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
@@ -549,7 +554,8 @@ class TransformerBlock(nn.Module):
                 dropout=args.dropout,
             )
 
-    def forward(self, x, pos_cis=None, kv_cache=False):
+    def _block_forward(self, x, pos_cis, kv_cache):
+        """整块前向（attention + FFN），用于 gradient checkpointing"""
         attn_input = self.attention_norm(x)
         if self.use_pos_cis:
             h = x + self.attention(attn_input, pos_cis, kv_cache)
@@ -564,6 +570,13 @@ class TransformerBlock(nn.Module):
         else:
             out = h + self.feed_forward(ffn_input)
             return out, None
+
+    def forward(self, x, pos_cis=None, kv_cache=False):
+        gc = self.args.gradient_checkpointing
+        if gc == 'all' or (gc == 'linear_attn' and self.layer_type == "linear_attention"):
+            return cp.checkpoint(self._block_forward, x, pos_cis, kv_cache,
+                                 use_reentrant=False)
+        return self._block_forward(x, pos_cis, kv_cache)
 
 
 class MindLM(PreTrainedModel, GenerationMixin):
