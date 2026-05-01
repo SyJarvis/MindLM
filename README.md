@@ -132,10 +132,10 @@ python -c "import torch; print(torch.__version__); print(torch.cuda.is_available
 
 ```bash
 python pretrain.py \
-    --model_config mindlm_0.04b \
-    --batch_size 64 \
-    --epochs 5 \
-    --accumulation_steps 8
+    --model_config mindlm_0.5b \
+    --batch_size 32 \
+    --epochs 3 \
+    --accumulation_steps 2
 ```
 
 - 参数量：43.6M（隐藏维度 576，12 层，9 头）
@@ -162,12 +162,15 @@ python pretrain.py \
 #### 3. 分布式训练
 
 ```bash
-# 单机多卡
-torchrun --nproc_per_node=2 pretrain.py \
-    --model_config mindlm_0.1b \
-    --batch_size 80 \
-    --accumulation_steps 2 \
+# 单机多卡 2*pro6000 = 2 * 96 = 192GB
+torchrun --nproc_per_node=4 pretrain.py \
+    --model_config mindlm_0.5b \
+    --batch_size 128 \
+    --accumulation_steps 4 \
     --epochs 3 \
+    --learning_rate 3e-4 \
+    --warmup_iters 200 \
+    --dtype bfloat16 \
     --ddp \
     --num_workers 8
 ```
