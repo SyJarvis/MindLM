@@ -1,32 +1,19 @@
-import json, os
+"""Model configuration loading helpers."""
 
-CONFIG_DIR = os.path.join(os.path.dirname(__file__), 'config')
+import json
+from pathlib import Path
+
+
+CONFIG_DIR = Path(__file__).resolve().parent / "config"
+SUPPORTED_CONFIGS = ("mindlm_0.1b", "mindlm_0.1b_moe", "mindlm_0.8b")
+
 
 def load_config(name: str) -> dict:
-    model_config_path = os.path.join(CONFIG_DIR, f"{name}.json")
-    with open(model_config_path, 'r') as f:
-        return json.load(f)
-    
-if __name__ == "__main__":
-    MindLM_0_5B = load_config("mindlm_0.5b")
-    MindLM_1B = load_config("mindlm_1b")
-    
-"""
-  ┌────────────────────┬────────────────────┬────────┐
-  │        组件        │        计算        │ 参数量 │
-  ├────────────────────┼────────────────────┼────────┤
-  │ Embedding (tied)   │ 6400 × 768         │ 4.9M   │
-  ├────────────────────┼────────────────────┼────────┤
-  │ 每层 Standard Attn │ 4 × 768²           │ 2.4M   │
-  ├────────────────────┼────────────────────┼────────┤
-  │ 每层 GatedDeltaNet │ ~768 × 2304 + 768² │ ~2.8M  │
-  ├────────────────────┼────────────────────┼────────┤
-  │ 每层 MoE (4+1专家) │ 5 × 3 × 768 × 2048 │ ~23.6M │
-  ├────────────────────┼────────────────────┼────────┤
-  │ 每层总计           │                    │ ~26M   │
-  ├────────────────────┼────────────────────┼────────┤
-  │ 16层总计           │                    │ ~420M  │
-  ├────────────────────┼────────────────────┼────────┤
-  │ + Embedding        │                    │ ~425M  │
-  └────────────────────┴────────────────────┴────────┘
-"""
+    """Load one of the supported model configurations."""
+    if name not in SUPPORTED_CONFIGS:
+        supported = ", ".join(SUPPORTED_CONFIGS)
+        raise ValueError(f"Unsupported model config '{name}'. Choose one of: {supported}")
+
+    model_config_path = CONFIG_DIR / f"{name}.json"
+    with model_config_path.open("r", encoding="utf-8") as file:
+        return json.load(file)

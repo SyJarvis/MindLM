@@ -4,6 +4,7 @@ MindLM: MiniMind with Linear Attention + MoE
 """
 
 import math
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,6 +12,13 @@ import torch.utils.checkpoint as cp
 from typing import List, Optional, Tuple
 from transformers import PreTrainedModel, PretrainedConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+
+@dataclass
+class MindLMCausalLMOutputWithPast(CausalLMOutputWithPast):
+    """Causal LM output extended with the MoE load-balancing loss."""
+
+    aux_loss: Optional[torch.FloatTensor] = None
 
 
 class RMSNorm(nn.Module):
@@ -185,7 +193,6 @@ class GatedDeltaNet(nn.Module):
         b = self.in_proj_b(x)
         a = self.in_proj_a(x)
 
-        conv_state = F.pad(mixed_qkv, (self.conv_kernel_size - mixed_qkv.shape[-1], 0))
         mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
         mixed_qkv = mixed_qkv.transpose(1, 2)
 
@@ -521,6 +528,21 @@ class MindLMConfig(PretrainedConfig):
         self.tie_word_embeddings = True         # tok_embeddings 和 output 共享权重
         self.conv_kernel_size = conv_kernel_size    # 因果卷积核大小
         self.gradient_checkpointing = gradient_checkpointing  # 梯度检查点策略
+        self.use_cache = False
+
+        if dim % n_heads != 0:
+            raise ValueError("dim must be divisible by n_heads")
+        if n_kv_heads is not None and n_heads % n_kv_heads != 0:
+            raise ValueError("n_heads must be divisible by n_kv_heads")
+        if linear_attn_heads is not None and n_heads % linear_attn_heads != 0:
+            raise ValueError("n_heads must be divisible by linear_attn_heads")
+        if len(self.layer_types) != n_layers:
+            raise ValueError("layer_types must contain exactly n_layers entries")
+        invalid_layer_types = set(self.layer_types) - {"attention", "linear_attention"}
+        if invalid_layer_types:
+            raise ValueError(f"Unsupported layer types: {sorted(invalid_layer_types)}")
+        if use_moe and not 1 <= num_experts_per_tok <= n_routed_experts:
+            raise ValueError("num_experts_per_tok must be between 1 and n_routed_experts")
 
 
 class TransformerBlock(nn.Module):
@@ -638,12 +660,34 @@ class MindLM(PreTrainedModel, GenerationMixin):
             param = self.get_parameter(tied_param)
             param._is_hf_initialized = True
 
-    def forward(self, tokens=None, targets=None, **kwargs):
-        if 'input_ids' in kwargs:
-            tokens = kwargs['input_ids']
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        labels=None,
+        tokens=None,
+        targets=None,
+        **kwargs,
+    ):
+        """Run a full causal-LM forward pass without a KV cache.
 
-        _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
+        ``labels`` follows the Transformers convention: positions marked ``-100``
+        are ignored. ``tokens`` and ``targets`` remain as compatibility aliases for
+        the project's older scripts.
+        """
+        if input_ids is None:
+            input_ids = tokens
+        if labels is None:
+            labels = targets
+        if input_ids is None:
+            raise ValueError("input_ids is required")
+
+        _bsz, seqlen = input_ids.shape
+        if seqlen > self.config.max_seq_len:
+            raise ValueError(
+                f"Input length {seqlen} exceeds max_seq_len={self.config.max_seq_len}."
+            )
+        h = self.tok_embeddings(input_ids)
         h = self.dropout(h)
 
         pos_cis = None
@@ -659,75 +703,91 @@ class MindLM(PreTrainedModel, GenerationMixin):
 
         h = self.norm(h)
 
-        if targets is not None:
-            logits = self.output(h)
-            pad_id = getattr(self.config, 'pad_token_id', None)
-            if pad_id is None:
-                pad_id = self.config.vocab_size - 1
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                  ignore_index=pad_id)
-            if total_aux_loss > 0:
+        logits = self.output(h)
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                labels.reshape(-1),
+                ignore_index=-100,
+            )
+            if isinstance(total_aux_loss, torch.Tensor):
                 loss = loss + total_aux_loss
-        else:
-            logits = self.output(h[:, [-1], :])
-            loss = None
 
-        return CausalLMOutputWithPast(
+        return MindLMCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=None,
             hidden_states=None,
             attentions=None,
+            aux_loss=total_aux_loss if isinstance(total_aux_loss, torch.Tensor) else None,
         )
 
     @torch.inference_mode()
-    def generate(self, idx, eos, max_new_tokens, temperature=0.7, top_k=8):
+    def generate(
+        self,
+        input_ids=None,
+        max_new_tokens=20,
+        eos_token_id=None,
+        pad_token_id=None,
+        do_sample=True,
+        temperature=0.7,
+        top_k=8,
+        eos=None,
+        **kwargs,
+    ):
+        """Generate tokens with a compact Transformers-compatible interface.
+
+        MindLM currently recomputes the full context at each step because neither
+        its standard attention nor DeltaNet path exposes a KV/state cache.
+        """
+        if input_ids is None:
+            input_ids = kwargs.pop("idx", None)
+        if input_ids is None:
+            raise ValueError("input_ids is required")
+        if eos_token_id is None:
+            eos_token_id = eos if eos is not None else self.config.eos_token_id
+        if pad_token_id is None:
+            pad_token_id = self.config.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        if isinstance(eos_token_id, (list, tuple)):
+            eos_token_ids = set(eos_token_id)
+        elif eos_token_id is None:
+            eos_token_ids = set()
+        else:
+            eos_token_ids = {eos_token_id}
+
+        generated = input_ids
+        unfinished = torch.ones(generated.size(0), dtype=torch.bool, device=generated.device)
         for _ in range(max_new_tokens):
-            inference_res = self(idx)
-            logits = inference_res.logits[:, -1, :]
-
-            if temperature == 0.0:
-                _, idx_next = torch.topk(logits, k=1, dim=-1)
-            else:
-                logits = logits / temperature
-                if top_k is not None:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -float('Inf')
-                probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
-
-            if idx_next == eos:
+            if generated.size(1) >= self.config.max_seq_len:
                 break
 
-            idx = torch.cat((idx, idx_next), dim=1)
-            yield idx
+            logits = self(generated).logits[:, -1, :]
+            if do_sample and temperature > 0:
+                logits = logits / temperature
+                if top_k is not None and top_k > 0:
+                    threshold = torch.topk(logits, min(top_k, logits.size(-1))).values[:, [-1]]
+                    logits = logits.masked_fill(logits < threshold, -float("inf"))
+                probabilities = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probabilities, num_samples=1)
+            else:
+                next_token = logits.argmax(dim=-1, keepdim=True)
 
+            next_token = torch.where(
+                unfinished.unsqueeze(-1),
+                next_token,
+                torch.full_like(next_token, pad_token_id),
+            )
+            generated = torch.cat((generated, next_token), dim=1)
+            if eos_token_ids:
+                is_eos = torch.zeros_like(unfinished)
+                for token_id in eos_token_ids:
+                    is_eos |= next_token.squeeze(-1).eq(token_id)
+                unfinished &= ~is_eos
+                if not unfinished.any():
+                    break
 
-if __name__ == "__main__":
-    # 推荐配置：MiniMind-Small规模 (~30M)
-    config = MindLMConfig(
-        dim=512,
-        n_layers=8,
-        n_heads=8,
-        vocab_size=6400,  # 使用MiniMind词表大小
-        # MoE配置：减小专家数
-        use_moe=True,
-        n_routed_experts=4,      # 从8降到4
-        num_experts_per_tok=2,
-        n_shared_experts=1,
-        aux_loss_alpha=0.01,
-        # Linear Attention配置
-        use_linear_attn=True,
-        # 混合架构：前4层Attention，后4层Linear
-        layer_types=["attention"]*4 + ["linear_attention"]*4,
-    )
-
-    model = MindLM(config)
-    print(f"模型参数: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
-    def count_parameters(model):
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'LLM总参数量：{count_parameters(model) / 1e6:.3f} 百万')
-    tokens = torch.randint(0, config.vocab_size, (2, 128))
-    output = model(tokens)
-    print(f"输出logits形状: {output.logits.shape}")
-    print("✅ 测试通过!")
+        return generated
