@@ -86,12 +86,16 @@ def save_checkpoint(epoch, step, epoch_complete):
 def train_epoch(epoch, wandb, skip_steps=0):
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    start_time = time.time()
+    start_time = None
+    processed_batches = 0
+    processed_tokens = 0
     pending_steps = 0
 
     for step, (input_ids, targets, loss_mask) in enumerate(train_loader):
         if step < skip_steps:
             continue
+        if start_time is None:
+            start_time = time.time()
         input_ids = input_ids.to(args.device, non_blocking=True)
         targets = targets.to(args.device, non_blocking=True)
         loss_mask = loss_mask.to(args.device, non_blocking=True)
@@ -130,15 +134,25 @@ def train_epoch(epoch, wandb, skip_steps=0):
             optimizer_step(args.accumulation_steps / pending_steps)
             pending_steps = 0
 
+        processed_batches += 1
+        processed_tokens += input_ids.numel() * (dist.get_world_size() if ddp else 1)
         if step % args.log_interval == 0:
             elapsed = time.time() - start_time
-            remaining_minutes = elapsed / (step + 1) * (iter_per_epoch - step - 1) / 60
+            remaining_minutes = elapsed / processed_batches * (iter_per_epoch - step - 1) / 60
+            tokens_per_second = processed_tokens / elapsed
             log(
                 f"epoch={epoch + 1}/{args.epochs} step={step + 1}/{iter_per_epoch} "
-                f"loss={unscaled_loss.item():.4f} lr={lr:.7f} eta={remaining_minutes:.1f}m"
+                f"loss={unscaled_loss.item():.4f} lr={lr:.7f} "
+                f"tok/s={tokens_per_second:.0f} eta={remaining_minutes:.1f}m"
             )
             if wandb is not None and is_primary_process():
-                wandb.log({"loss": unscaled_loss.item(), "lr": lr, "epoch": epoch, "step": global_step})
+                wandb.log({
+                    "loss": unscaled_loss.item(),
+                    "lr": lr,
+                    "tokens_per_second": tokens_per_second,
+                    "epoch": epoch,
+                    "step": global_step,
+                })
 
         if (
             args.save_interval > 0
@@ -183,9 +197,13 @@ def parse_args():
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument("--no_persistent_workers", action="store_true")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--ddp", action="store_true", help="Expected when launched through torchrun")
+    parser.add_argument("--ddp_bucket_cap_mb", type=int, default=100)
+    parser.add_argument("--ddp_static_graph", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", default="MindLM-Pretrain")
@@ -195,6 +213,10 @@ def parse_args():
         parsed.tokenizer_path = str(
             REPOSITORY_ROOT / ("qwen3_tokenizer" if parsed.model_config == "mindlm_0.7b" else "mindlm_tokenizer")
         )
+    if parsed.prefetch_factor < 1:
+        raise ValueError("prefetch_factor must be positive")
+    if parsed.ddp_bucket_cap_mb < 1:
+        raise ValueError("ddp_bucket_cap_mb must be positive")
     return parsed
 
 
@@ -236,9 +258,13 @@ if __name__ == "__main__":
         model = DistributedDataParallel(
             model,
             device_ids=[int(os.environ["LOCAL_RANK"])],
+            broadcast_buffers=False,
+            gradient_as_bucket_view=True,
+            bucket_cap_mb=args.ddp_bucket_cap_mb,
             # Routed MoE experts can be unused on an individual rank for a
             # batch. Dense configurations keep the faster default path.
             find_unused_parameters=config.use_moe,
+            static_graph=args.ddp_static_graph and not config.use_moe,
         )
 
     if args.packed_data_prefix:
@@ -254,12 +280,18 @@ if __name__ == "__main__":
             raise ValueError("Pretraining CSV must contain a 'text' column")
         train_dataset = PretrainDataset(dataframe, tokenizer, max_length=config.max_seq_len)
     train_sampler = DistributedSampler(train_dataset, seed=1337) if ddp else EpochRandomSampler(train_dataset)
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "sampler": train_sampler,
+        "num_workers": args.num_workers,
+        "pin_memory": device_type == "cuda",
+    }
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = not args.no_persistent_workers
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
-        sampler=train_sampler,
-        num_workers=args.num_workers,
-        pin_memory=device_type == "cuda",
+        **loader_kwargs,
     )
     iter_per_epoch = len(train_loader)
     if iter_per_epoch == 0:
@@ -282,7 +314,11 @@ if __name__ == "__main__":
             resume_step = resume_metadata.get("step", -1) + 1
             log(f"Resuming epoch {start_epoch + 1} from batch {resume_step + 1}.")
 
-    log(f"Training {args.model_config}: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters")
+    global_batch_size = args.batch_size * args.accumulation_steps * (dist.get_world_size() if ddp else 1)
+    log(
+        f"Training {args.model_config}: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters, "
+        f"global_batch={global_batch_size}"
+    )
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
         train_epoch(epoch, wandb, skip_steps=resume_step if epoch == start_epoch else 0)

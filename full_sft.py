@@ -177,9 +177,13 @@ def parse_args():
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument("--no_persistent_workers", action="store_true")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--ddp", action="store_true", help="Expected when launched through torchrun")
+    parser.add_argument("--ddp_bucket_cap_mb", type=int, default=100)
+    parser.add_argument("--ddp_static_graph", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", default="MindLM-SFT")
@@ -189,6 +193,10 @@ def parse_args():
         parsed.tokenizer_path = str(
             REPOSITORY_ROOT / ("qwen3_tokenizer" if parsed.model_config == "mindlm_0.7b" else "mindlm_tokenizer")
         )
+    if parsed.prefetch_factor < 1:
+        raise ValueError("prefetch_factor must be positive")
+    if parsed.ddp_bucket_cap_mb < 1:
+        raise ValueError("ddp_bucket_cap_mb must be positive")
     return parsed
 
 
@@ -230,7 +238,11 @@ if __name__ == "__main__":
         model = DistributedDataParallel(
             model,
             device_ids=[int(os.environ["LOCAL_RANK"])],
+            broadcast_buffers=False,
+            gradient_as_bucket_view=True,
+            bucket_cap_mb=args.ddp_bucket_cap_mb,
             find_unused_parameters=config.use_moe,
+            static_graph=args.ddp_static_graph and not config.use_moe,
         )
 
     dataframe = pd.read_csv(args.data_path)
@@ -240,13 +252,16 @@ if __name__ == "__main__":
         raise ValueError(f"SFT CSV is missing columns: {sorted(missing_columns)}")
     train_dataset = SFTDataset(dataframe, tokenizer, max_length=config.max_seq_len)
     train_sampler = DistributedSampler(train_dataset, seed=1337) if ddp else EpochRandomSampler(train_dataset)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        sampler=train_sampler,
-        num_workers=args.num_workers,
-        pin_memory=device_type == "cuda",
-    )
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "sampler": train_sampler,
+        "num_workers": args.num_workers,
+        "pin_memory": device_type == "cuda",
+    }
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = not args.no_persistent_workers
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
+    train_loader = DataLoader(train_dataset, **loader_kwargs)
     iter_per_epoch = len(train_loader)
     if iter_per_epoch == 0:
         raise ValueError("SFT dataset is empty")
@@ -268,7 +283,11 @@ if __name__ == "__main__":
             resume_step = resume_metadata.get("step", -1) + 1
             log(f"Resuming epoch {start_epoch + 1} from batch {resume_step + 1}.")
 
-    log(f"Fine-tuning {args.model_config}: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters")
+    global_batch_size = args.batch_size * args.accumulation_steps * (dist.get_world_size() if ddp else 1)
+    log(
+        f"Fine-tuning {args.model_config}: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters, "
+        f"global_batch={global_batch_size}"
+    )
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
         train_epoch(epoch, wandb, skip_steps=resume_step if epoch == start_epoch else 0)

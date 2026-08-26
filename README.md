@@ -180,6 +180,8 @@ qwen3_tokenizer/       Copied Qwen3-0.6B tokenizer files (no model weights)
 modeling_mindlm.py      Model, hybrid attention, and generation implementation
 dataset.py              Pretraining and answer-only SFT datasets
 training_utils.py       Shared config, loss, sampler, and checkpoint helpers
+prepare_pretrain_data.py  Offline EOS packing for padding-free pretraining
+bench_train_step.py     Synthetic train-step benchmark and profiler entry point
 pretrain.py             Pretraining entry point
 full_sft.py             Full SFT entry point
 eval/                   Checkpoint evaluation scripts
