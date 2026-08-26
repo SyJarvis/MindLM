@@ -166,7 +166,7 @@ def parse_args():
     parser.add_argument("--out_dir", default="out", help="Checkpoint directory")
     parser.add_argument("--data_path", default="data/sft_data_single.csv", help="CSV containing history, q, and a columns")
     parser.add_argument("--tokenizer_path", default=None)
-    parser.add_argument("--model_config", choices=("mindlm_0.1b", "mindlm_0.1b_moe", "mindlm_0.8b"), default="mindlm_0.1b")
+    parser.add_argument("--model_config", choices=("mindlm_0.1b", "mindlm_0.1b_moe", "mindlm_0.7b"), default="mindlm_0.1b")
     parser.add_argument("--resume_from", required=True, help="Pretraining state dict or MindLM checkpoint")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -187,7 +187,7 @@ def parse_args():
     parsed = parser.parse_args()
     if parsed.tokenizer_path is None:
         parsed.tokenizer_path = str(
-            REPOSITORY_ROOT / ("qwen3_tokenizer" if parsed.model_config == "mindlm_0.8b" else "mindlm_tokenizer")
+            REPOSITORY_ROOT / ("qwen3_tokenizer" if parsed.model_config == "mindlm_0.7b" else "mindlm_tokenizer")
         )
     return parsed
 

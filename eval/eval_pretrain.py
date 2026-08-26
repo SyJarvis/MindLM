@@ -19,7 +19,7 @@ PROMPTS = ["人工智能", "中国的首都是", "机器学习是"]
 
 def main():
     parser = argparse.ArgumentParser(description="MindLM pretraining evaluation")
-    parser.add_argument("--config", choices=("mindlm_0.1b", "mindlm_0.1b_moe", "mindlm_0.8b"), default="mindlm_0.1b")
+    parser.add_argument("--config", choices=("mindlm_0.1b", "mindlm_0.1b_moe", "mindlm_0.7b"), default="mindlm_0.1b")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--tokenizer_path", default=None)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
@@ -29,7 +29,7 @@ def main():
     args = parser.parse_args()
     if args.tokenizer_path is None:
         args.tokenizer_path = str(
-            PROJECT_ROOT / ("qwen3_tokenizer" if args.config == "mindlm_0.8b" else "mindlm_tokenizer")
+            PROJECT_ROOT / ("qwen3_tokenizer" if args.config == "mindlm_0.7b" else "mindlm_tokenizer")
         )
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)

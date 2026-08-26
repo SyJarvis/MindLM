@@ -3,7 +3,7 @@
 MindLM is an experimental causal language model that combines standard RoPE
 attention, Gated DeltaNet linear attention, and an optional sparse MoE feed-forward
 layer. The runnable training, SFT, export, and inference scripts share one
-configuration contract across the supported 0.1B and 0.8B variants.
+configuration contract across the supported 0.1B and 0.7B variants.
 
 ## Supported Configurations
 
@@ -13,12 +13,16 @@ Only the following configurations are supported by the runnable scripts:
 | --- | --- | --- | --- | --- |
 | `mindlm_0.1b` | SwiGLU | No | 1024 | Default Dense baseline |
 | `mindlm_0.1b_moe` | 4 routed + 1 shared expert | Top-2 | 1024 | MoE experiment |
-| `mindlm_0.8b` | SwiGLU | No | 4096 | Qwen3 tokenizer Dense model |
+| `mindlm_0.7b` | SwiGLU | No | 4096 | Qwen3 tokenizer Dense model |
 
 The 0.1B configurations use 16 layers with 12 query heads, 3 KV heads, and 12
-linear-attention layers plus 4 standard attention layers. The 0.8B configuration
+linear-attention layers plus 4 standard attention layers. The 0.7B configuration
 uses 40 layers, 16 query heads, 4 KV heads, 30 linear-attention layers, and 10
-standard attention layers. Its copied Qwen3 tokenizer has 151,936 tokens.
+standard attention layers. Its copied Qwen3 tokenizer has 151,669 usable tokens.
+Its linear-attention layers use the complete gated delta rule. CUDA runs switch
+automatically to the fused FLA kernel when `flash-linear-attention` is installed;
+otherwise they use the PyTorch reference. The legacy `simple` recurrence remains
+available for old checkpoints.
 
 Qwen3 is a causal LM tokenizer and has no BERT-style `<mask>` token. Pretraining
 uses the dataset's binary `loss_mask` to exclude padding positions.
@@ -70,7 +74,7 @@ python pretrain.py \
   --accumulation_steps 8
 ```
 
-For the 0.8B design, use `--model_config mindlm_0.8b`; it defaults to the copied
+For the 0.7B design, use `--model_config mindlm_0.7b`; it defaults to the copied
 `qwen3_tokenizer/` directory. Older 0.1B checkpoints continue to use
 `mindlm_tokenizer/`. Pass `--tokenizer_path` to override either default.
 
@@ -92,12 +96,12 @@ python full_sft.py \
 ```
 
 多卡训练使用 PyTorch DDP。`--batch_size` 是每张 GPU 的 batch size，实际 global
-batch size 为 `GPU 数 x batch_size x accumulation_steps`。例如 4 张卡训练 0.8B：
+batch size 为 `GPU 数 x batch_size x accumulation_steps`。例如 4 张卡训练 0.7B：
 
 ```bash
 torchrun --nproc_per_node=4 pretrain.py \
   --ddp \
-  --model_config mindlm_0.8b \
+  --model_config mindlm_0.7b \
   --data_path data/pretrain_data.csv \
   --batch_size 2 \
   --accumulation_steps 8 \
@@ -109,8 +113,8 @@ torchrun --nproc_per_node=4 pretrain.py \
 ```bash
 torchrun --nproc_per_node=4 full_sft.py \
   --ddp \
-  --model_config mindlm_0.8b \
-  --resume_from out/mindlm_pretrain_mindlm_0.8b_epoch0.pt \
+  --model_config mindlm_0.7b \
+  --resume_from out/mindlm_pretrain_mindlm_0.7b_epoch0.pt \
   --data_path data/sft_data_single.csv \
   --batch_size 2 \
   --accumulation_steps 8

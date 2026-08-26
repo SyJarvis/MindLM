@@ -204,10 +204,13 @@ scores = Q × Kᵀ                   # 递归状态: S ∈ (d_k, d_v) 固定大�
 attn = softmax(scores)                # 1. 衰减旧记忆
    → 精确归一化                        S_t = exp(g_t) × S_{t-1}
 
-output = attn × V                     # 2. 写入新信息 (β 门控写入强度)
-   → 加权求和                          S_t = S_t + k_t × (v_t × β_t)
+output = attn × V                     # 2. 计算状态对当前 value 的预测
+   → 加权求和                          v_hat_t = k_t × S_t
 
-                                    # 3. 查询记忆
+                                    # 3. 以预测残差写入新信息 (β 门控写入强度)
+                                      S_t = S_t + k_t × ((v_t - v_hat_t) × β_t)
+
+                                    # 4. 查询记忆
                                       o_t = q_t × S_t
 ```
 
@@ -219,7 +222,11 @@ output = attn × V                     # 2. 写入新信息 (β 门控写入强�
 
 #### 分块并行计算
 
-纯逐时间步的 Python 循环太慢。MindLM 采用 **Chunked Gated Delta Attention**：
+实现提供完整规则 reference，并保留旧版简化规则作为兼容模式。完整规则的
+PyTorch reference 目前按 token 递推，先用于数值基线；训练 kernel 优化在基线
+稳定后单独接入。
+
+当前简化实现采用 **Chunked Gated Delta Attention**：
 
 ```
 将序列分成 chunk_size=64 的块:

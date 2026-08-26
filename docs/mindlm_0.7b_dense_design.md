@@ -1,8 +1,8 @@
-# MindLM Dense 0.8B 方案（Qwen3 tokenizer）
+# MindLM Dense 0.7B 方案（Qwen3 tokenizer）
 
 ## 1. 目标
 
-Dense 0.8B 主要学习稳定的语言建模、可验证推理、任务规划和工具调用。知识不追求覆盖所有百科内容，外部检索、计算器、代码执行器和业务 API 负责提供事实和确定性计算。
+Dense 0.7B 主要学习稳定的语言建模、可验证推理、任务规划和工具调用。知识不追求覆盖所有百科内容，外部检索、计算器、代码执行器和业务 API 负责提供事实和确定性计算。
 
 ```text
 用户请求 -> 判断 -> 直接回答或生成工具调用 -> 执行器运行工具 -> 读取结果并总结
@@ -18,7 +18,9 @@ Dense 0.8B 主要学习稳定的语言建模、可验证推理、任务规划和
 
 已复制到仓库的 `qwen3_tokenizer/`，包含 `tokenizer.json`、`tokenizer_config.json`、`vocab.json` 和 `merges.txt`。复用的是 tokenizer 文件，不复用 Qwen3-0.6B 的模型权重；Qwen3 权重的层数、注意力结构和参数形状与 MindLM 不兼容。
 
-Qwen3 tokenizer 的实际词表大小是 **151,936**。关键 token 为：
+Qwen3 tokenizer 在 `transformers` 中的实际可用长度是 **151,669**。Qwen3 原始
+`config.json` 的 `151,936` 是模型 embedding 的预留尺寸，不是本项目复制 tokenizer
+的实际 token 数；MindLM 训练时以 `len(tokenizer)` 的 151,669 为准。关键 token 为：
 
 | 用途 | token | id |
 | --- | --- | ---: |
@@ -31,15 +33,15 @@ Qwen3 tokenizer 的实际词表大小是 **151,936**。关键 token 为：
 
 Qwen3 是 causal LM，**没有 BERT 式 `<mask>` token**。预训练不向文本插入 `<mask>`；数据集只生成独立的二值 `loss_mask`，padding 位置为 0，真实 token 位置为 1。训练 loss 由 `masked_language_model_loss` 按 token mask 计算。
 
-## 3. Dense 0.8B 配置
+## 3. Dense 0.7B 配置
 
 | 参数 | 值 |
 | --- | ---: |
-| `dim` | 1152 |
+| `dim` | 1024 |
 | `n_layers` | 40 |
 | `n_heads` / `n_kv_heads` | 16 / 4 |
 | `linear_attn_heads` | 16 |
-| `head_dim` | 72 |
+| `head_dim` | 64 |
 | `hidden_dim` | 2816 |
 | `max_seq_len` | 4096 |
 | 标准 Attention | 10 层 |
@@ -47,9 +49,16 @@ Qwen3 是 causal LM，**没有 BERT 式 `<mask>` token**。预训练不向文本
 | `use_moe` | `false` |
 | embedding | tied |
 
-层模式为 `[L, L, L, A] x 10`。按当前实现和 151,936 词表估算约 **798.2M 参数**，最终以实际实例化后的 `sum(p.numel())` 为准。
+层模式为 `[L, L, L, A] x 10`。按当前实现和 151,669 词表估算约 **686.3M 参数**，最终以实际实例化后的 `sum(p.numel())` 为准。
 
-配置文件是 `config/mindlm_0.8b.json`。`build_model_config` 会再次从 tokenizer 读取 `len(tokenizer)` 及 pad/bos/eos id，避免配置与 tokenizer 漂移。
+配置文件是 `config/mindlm_0.7b.json`。`build_model_config` 会再次从 tokenizer 读取 `len(tokenizer)` 及 pad/bos/eos id，避免配置与 tokenizer 漂移。
+
+线性注意力使用 `linear_attn_impl: "gated_delta_rule"`。它是完整 Gated Delta
+Rule：先衰减 state，再用 `v - k @ state` 的预测残差写入，而不是旧版的直接
+`beta * v` 累加。CUDA 环境检测到 `flash-linear-attention` 时会自动使用
+FLA chunk kernel，否则回退到 FP32 state 的 PyTorch reference。reference 已通过
+逐 token 前向和反向数值测试，并支持 `[B, H, D_K, D_V]` 的
+`initial_state` 与 `return_state`，为增量推理和跨 chunk 状态缓存保留接口。
 
 ## 4. 数据和 mask 约定
 

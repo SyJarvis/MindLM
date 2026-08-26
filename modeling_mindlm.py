@@ -13,6 +13,15 @@ from typing import List, Optional, Tuple
 from transformers import PreTrainedModel, PretrainedConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+try:
+    # Optional fused training kernel. When available, ``gated_delta_rule``
+    # inference and training dispatch to this chunk kernel instead of the
+    # per-token PyTorch reference. The reference path remains the fallback for
+    # stateful recurrence and for environments without fla installed.
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _fla_chunk_gdr
+except ImportError:  # pragma: no cover - fla is an optional acceleration dep
+    _fla_chunk_gdr = None
+
 
 @dataclass
 class MindLMCausalLMOutputWithPast(CausalLMOutputWithPast):
@@ -100,7 +109,7 @@ class Attention(nn.Module):
         self.dropout = args.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
 
-        mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
+        mask = torch.ones((1, 1, args.max_seq_len, args.max_seq_len), dtype=torch.bool)
         mask = torch.triu(mask, diagonal=1)
         self.register_buffer("mask", mask, persistent=False)
 
@@ -131,7 +140,7 @@ class Attention(nn.Module):
             )
         else:
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
-            scores = scores + self.mask[:, :, :seqlen, :seqlen]
+            scores = scores.masked_fill(self.mask[:, :, :seqlen, :seqlen], float("-inf"))
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
             output = torch.matmul(scores, xv)
@@ -144,8 +153,10 @@ class Attention(nn.Module):
 
 class GatedDeltaNet(nn.Module):
     """
-    Gated DeltaNet Linear Attention
-    简化版实现，适配MiniMind架构
+    Gated DeltaNet linear attention with selectable legacy and full rules.
+
+    ``simple`` preserves the original MindLM recurrence for old checkpoints;
+    ``gated_delta_rule`` applies the prediction-residual update used by FLA.
     """
     def __init__(self, args):
         super().__init__()
@@ -161,6 +172,14 @@ class GatedDeltaNet(nn.Module):
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.conv_kernel_size = getattr(args, 'conv_kernel_size', 4)
+        self.chunk_size = getattr(args, 'linear_attn_chunk_size', 64)
+        self.linear_attn_impl = getattr(args, 'linear_attn_impl', 'simple')
+        if self.linear_attn_impl not in {'simple', 'gated_delta_rule'}:
+            raise ValueError(
+                "linear_attn_impl must be 'simple' or 'gated_delta_rule'"
+            )
+        if self.chunk_size < 1:
+            raise ValueError("linear_attn_chunk_size must be positive")
 
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv1d = nn.Conv1d(
@@ -170,6 +189,11 @@ class GatedDeltaNet(nn.Module):
             groups=self.conv_dim,
             padding=self.conv_kernel_size - 1,
             bias=False,
+        )
+        self.register_buffer(
+            "chunk_causal_mask",
+            torch.tril(torch.ones(self.chunk_size, self.chunk_size, dtype=torch.bool)),
+            persistent=False,
         )
 
         self.in_proj_qkv = nn.Linear(self.hidden_size, self.conv_dim, bias=False)
@@ -214,7 +238,23 @@ class GatedDeltaNet(nn.Module):
             query = query.repeat_interleave(n_rep, dim=2)
             key = key.repeat_interleave(n_rep, dim=2)
 
-        core_attn_out = self.simple_gated_delta_attention(query, key, value, g, beta)
+        if self.linear_attn_impl == 'gated_delta_rule':
+            # Prefer the fused FLA chunk kernel when available; it is
+            # numerically aligned with the reference but far faster. Fall back
+            # to the per-token reference when fla is missing, on CPU (the FLA
+            # Triton kernel is CUDA-only), or when a caller explicitly requested
+            # the reference path (e.g. debugging).
+            use_fla = (
+                _fla_chunk_gdr is not None
+                and not getattr(self, 'use_reference_gdr', False)
+                and query.is_cuda
+            )
+            if use_fla:
+                core_attn_out = self.gated_delta_rule_fla(query, key, value, g, beta)
+            else:
+                core_attn_out = self.gated_delta_rule_attention(query, key, value, g, beta)
+        else:
+            core_attn_out = self.simple_gated_delta_attention(query, key, value, g, beta)
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
@@ -225,6 +265,138 @@ class GatedDeltaNet(nn.Module):
         output = self.resid_dropout(output)
         return output
 
+    def gated_delta_rule_attention(
+        self,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        chunk_size=None,
+        initial_state=None,
+        return_state=False,
+    ):
+        """Reference implementation of the complete gated delta rule.
+
+        The recurrent state is updated with the prediction residual rather than
+        adding the value directly.  This is intentionally kept as a compact
+        PyTorch reference until a fused FLA/TileLang training kernel is wired in.
+        The loop is chunked so the dispatch boundary is explicit and can later be
+        replaced by a chunk kernel without changing the model interface.
+
+        For each token, with ``S`` shaped ``[D_K, D_V]``:
+
+        ``S <- exp(g) S``
+        ``v_new <- beta * (v - k @ S)``
+        ``S <- S + outer(k, v_new)``
+        ``o <- q @ S``
+        """
+        chunk_size = self.chunk_size if chunk_size is None else chunk_size
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be positive")
+
+        # Public callers use [B, T, H, D], while the recurrence is more natural
+        # in [B, H, T, D].  Keep the accumulator in FP32 for BF16 stability.
+        query = query.transpose(1, 2).contiguous()
+        key = key.transpose(1, 2).contiguous()
+        value = value.transpose(1, 2).contiguous()
+        beta = beta.transpose(1, 2).contiguous()
+        g = g.transpose(1, 2).contiguous()
+
+        output_dtype = query.dtype
+        query = l2norm(query, dim=-1).float()
+        key = l2norm(key, dim=-1).float()
+        value = value.float()
+        beta = beta.float()
+        g = g.float()
+
+        batch_size, num_heads, seq_len, head_dim = query.shape
+        value_dim = value.shape[-1]
+        query = query * (head_dim ** -0.5)
+        if initial_state is None:
+            state = torch.zeros(
+                batch_size,
+                num_heads,
+                head_dim,
+                value_dim,
+                device=query.device,
+                dtype=torch.float32,
+            )
+        else:
+            expected_shape = (batch_size, num_heads, head_dim, value_dim)
+            if tuple(initial_state.shape) != expected_shape:
+                raise ValueError(
+                    f"initial_state must have shape {expected_shape}, "
+                    f"got {tuple(initial_state.shape)}"
+                )
+            state = initial_state.to(device=query.device, dtype=torch.float32)
+        if seq_len == 0:
+            output = torch.empty(
+                batch_size,
+                0,
+                num_heads,
+                value_dim,
+                device=query.device,
+                dtype=output_dtype,
+            )
+            return (output, state) if return_state else output
+        output_chunks = []
+        for start in range(0, seq_len, chunk_size):
+            end = min(start + chunk_size, seq_len)
+            chunk_outputs = []
+            for t in range(start, end):
+                # Avoid in-place updates: all intermediate states remain valid
+                # for autograd when training the reference implementation.
+                state = state * torch.exp(g[:, :, t]).unsqueeze(-1).unsqueeze(-1)
+                predicted = torch.einsum('bhd,bhdv->bhv', key[:, :, t], state)
+                residual = beta[:, :, t].unsqueeze(-1) * (value[:, :, t] - predicted)
+                state = state + key[:, :, t].unsqueeze(-1) * residual.unsqueeze(-2)
+                chunk_outputs.append(torch.einsum('bhd,bhdv->bhv', query[:, :, t], state))
+            output_chunks.append(torch.stack(chunk_outputs, dim=2))
+
+        output = torch.cat(output_chunks, dim=2)
+        output = output.transpose(1, 2).contiguous().to(dtype=output_dtype)
+        return (output, state) if return_state else output
+
+    def gated_delta_rule_fla(self, query, key, value, g, beta):
+        """Fused FLA chunk kernel for the gated delta rule.
+
+        Numerically equivalent to :meth:`gated_delta_rule_attention` (the
+        per-token reference) but offloads the chunked recurrence to the FLA
+        Triton kernel. Both l2-normalization of ``query``/``key`` and the
+        ``1/sqrt(head_dim)`` scale are fused into the kernel, matching the
+        reference. ``query``, ``key``, ``value`` are ``[B, T, H, D]``;
+        ``g``/``beta`` are ``[B, T, H]`` — exactly the public calling layout
+        used by :meth:`forward`, so no transposes are needed here.
+
+        Only the plain forward recurrence is supported; stateful calls
+        (``initial_state``/``return_state``) still go through the reference.
+        """
+        if _fla_chunk_gdr is None:
+            raise RuntimeError(
+                "flash-linear-attention is required for the FLA kernel path "
+                "but is not installed; install it or use the reference path."
+            )
+        if self.chunk_size not in {16, 32, 64}:
+            raise ValueError(
+                "The FLA gated delta rule kernel requires "
+                "linear_attn_chunk_size to be 16, 32, or 64"
+            )
+        output_dtype = query.dtype
+        scale = query.shape[-1] ** -0.5
+        out = _fla_chunk_gdr(
+            query,
+            key,
+            value,
+            g.float(),
+            beta.float(),
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+            chunk_size=self.chunk_size,
+        )
+        out = out[0] if isinstance(out, tuple) else out
+        return out.to(dtype=output_dtype)
+
     def gated_norm(self, x, gate):
         """门控RMSNorm"""
         input_dtype = x.dtype
@@ -234,12 +406,16 @@ class GatedDeltaNet(nn.Module):
         x = x * F.silu(gate.float())
         return x.to(input_dtype)
 
-    def simple_gated_delta_attention(self, query, key, value, g, beta, chunk_size=64):
+    def simple_gated_delta_attention(self, query, key, value, g, beta, chunk_size=None):
         """Chunked Gated Delta Attention — 分块并行计算，替代逐时间步Python循环
 
         将序列分成 chunk_size 大小的块，块内用矩阵乘法并行计算，
         块间传递 recurrent state。将 Python 循环从 T 次降到 T/chunk_size 次。
         """
+        chunk_size = self.chunk_size if chunk_size is None else chunk_size
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be positive")
+
         query = query.transpose(1, 2).contiguous()
         key = key.transpose(1, 2).contiguous()
         value = value.transpose(1, 2).contiguous()
@@ -279,9 +455,12 @@ class GatedDeltaNet(nn.Module):
             # === 块内：衰减加权线性注意力 ===
             # 衰减比 log_ratio[i,j] = log_cg[i] - log_cg[j]，对应 g[j+1]*...*g[i]
             log_ratio = log_cg.unsqueeze(-1) - log_cg.unsqueeze(-2)  # (B, H, C, C)
-            causal_mask = torch.tril(
-                torch.ones(C, C, device=query.device, dtype=query.dtype)
-            )
+            if chunk_size == self.chunk_size:
+                causal_mask = self.chunk_causal_mask[:C, :C]
+            else:
+                causal_mask = torch.tril(
+                    torch.ones(C, C, device=query.device, dtype=torch.bool)
+                )
 
             # 衰减加权注意力矩阵
             # clamp(max=0) 防止上三角 exp 溢出：exp(大正数) * mask(0) = inf*0 = NaN
@@ -487,6 +666,8 @@ class MindLMConfig(PretrainedConfig):
                                           # 推荐每4层一个标准attention（如1B: 12线性+4标准）
         # ========== GatedDeltaNet 特定参数 ==========
         conv_kernel_size: int = 4,        # 因果卷积核大小，提供局部位置感知，替代位置编码
+        linear_attn_chunk_size: int = 64, # 线性注意力块大小；须在训练前固定
+        linear_attn_impl: str = 'simple',  # 'simple' 兼容旧权重；'gated_delta_rule' 为完整规则
         # ========== 训练优化 ==========
         gradient_checkpointing: str = 'off',  # 梯度检查点策略：'off'=关闭，'linear_attn'=仅linear层，'all'=所有层
         **kwargs
@@ -527,11 +708,17 @@ class MindLMConfig(PretrainedConfig):
             self.layer_types = layer_types          # 从 JSON 配置加载的层类型列表
         self.tie_word_embeddings = True         # tok_embeddings 和 output 共享权重
         self.conv_kernel_size = conv_kernel_size    # 因果卷积核大小
+        self.linear_attn_chunk_size = linear_attn_chunk_size
+        self.linear_attn_impl = linear_attn_impl
         self.gradient_checkpointing = gradient_checkpointing  # 梯度检查点策略
         self.use_cache = False
 
         if dim % n_heads != 0:
             raise ValueError("dim must be divisible by n_heads")
+        if linear_attn_chunk_size < 1:
+            raise ValueError("linear_attn_chunk_size must be positive")
+        if linear_attn_impl not in {'simple', 'gated_delta_rule'}:
+            raise ValueError("linear_attn_impl must be 'simple' or 'gated_delta_rule'")
         if n_kv_heads is not None and n_heads % n_kv_heads != 0:
             raise ValueError("n_heads must be divisible by n_kv_heads")
         if linear_attn_heads is not None and n_heads % linear_attn_heads != 0:
@@ -746,9 +933,9 @@ class MindLM(PreTrainedModel, GenerationMixin):
         if input_ids is None:
             raise ValueError("input_ids is required")
         if eos_token_id is None:
-            eos_token_id = eos if eos is not None else self.config.eos_token_id
+            eos_token_id = eos if eos is not None else getattr(self.config, "eos_token_id", None)
         if pad_token_id is None:
-            pad_token_id = self.config.pad_token_id
+            pad_token_id = getattr(self.config, "pad_token_id", None)
         if pad_token_id is None:
             pad_token_id = 0
 
