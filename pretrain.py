@@ -1,15 +1,10 @@
-"""
-MindLM Pretrain Script
-使用混合架构(Attention + Linear Attention) + MoE进行预训练
-"""
+"""Pretrain one of the supported MindLM configurations."""
 
-import os
-import sys
-import platform
 import argparse
-import time
 import math
-import warnings
+import os
+import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import pandas as pd
@@ -17,434 +12,321 @@ import torch
 import torch.distributed as dist
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, DistributedSampler
-from contextlib import nullcontext
-
-# 添加项目根目录到路径
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
-
 from transformers import AutoTokenizer
-from MindLM.modeling_mindlm import MindLM, MindLMConfig
-from MindLM.dataset import PretrainDataset
-from MindLM.config import load_config
 
-warnings.filterwarnings('ignore')
+from dataset import PackedPretrainDataset, PretrainDataset
+from modeling_mindlm import MindLM
+from training_utils import (
+    build_model_config,
+    EpochRandomSampler,
+    load_model_checkpoint,
+    masked_language_model_loss,
+    save_training_checkpoint,
+)
 
 
-def Logger(content):
-    """日志输出，支持DDP"""
-    if not ddp or dist.get_rank() == 0:
-        print(content)
+REPOSITORY_ROOT = Path(__file__).resolve().parent
 
 
-def get_lr(it, all_steps, args):
-    """
-    学习率调度：warmup + cosine decay
-    """
-    warmup_iters = args.warmup_iters
-    lr_decay_iters = all_steps
+def is_primary_process():
+    return not ddp or dist.get_rank() == 0
+
+
+def log(message):
+    if is_primary_process():
+        print(message)
+
+
+def get_lr(step, total_steps):
+    if args.warmup_iters > 0 and step < args.warmup_iters:
+        return args.learning_rate * step / args.warmup_iters
+
+    decay_steps = max(total_steps - args.warmup_iters, 1)
+    progress = min(max((step - args.warmup_iters) / decay_steps, 0.0), 1.0)
     min_lr = args.learning_rate / 10
-
-    if it < warmup_iters:
-        return args.learning_rate * it / warmup_iters
-    if it > lr_decay_iters:
-        return min_lr
-
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (args.learning_rate - min_lr)
+    return min_lr + 0.5 * (1.0 + math.cos(math.pi * progress)) * (args.learning_rate - min_lr)
 
 
-def train_epoch(epoch, wandb):
-    """训练一个epoch"""
-    start_time = time.time()
+def optimizer_step(gradient_scale=1.0):
+    scaler.unscale_(optimizer)
+    if gradient_scale != 1.0:
+        for parameter in model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(gradient_scale)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad(set_to_none=True)
+
+
+def checkpoint_path(epoch=None):
+    suffix = "latest" if epoch is None else f"epoch{epoch}"
+    return Path(args.out_dir) / f"mindlm_pretrain_{args.model_config}_{suffix}.pt"
+
+
+def save_checkpoint(epoch, step, epoch_complete):
+    model.eval()
+    path = checkpoint_path(None if not epoch_complete else epoch)
+    save_training_checkpoint(
+        path,
+        model,
+        optimizer,
+        scaler,
+        config,
+        epoch,
+        step,
+        epoch_complete,
+        training_stage="pretrain",
+    )
+    log(f"Saved checkpoint: {path}")
     model.train()
 
-    for step, (X, Y, loss_mask) in enumerate(train_loader):
-        X = X.to(args.device)
-        Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
 
-        # 学习率调度
+def train_epoch(epoch, wandb, skip_steps=0):
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    start_time = None
+    processed_batches = 0
+    processed_tokens = 0
+    pending_steps = 0
+
+    for step, (input_ids, targets, loss_mask) in enumerate(train_loader):
+        if step < skip_steps:
+            continue
+        if start_time is None:
+            start_time = time.time()
+        input_ids = input_ids.to(args.device, non_blocking=True)
+        targets = targets.to(args.device, non_blocking=True)
+        loss_mask = loss_mask.to(args.device, non_blocking=True)
+
         global_step = epoch * iter_per_epoch + step
-        lr = get_lr(global_step, args.epochs * iter_per_epoch, args)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+        lr = get_lr(global_step, args.epochs * iter_per_epoch)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
 
-        # 前向传播
-        with ctx:
-            outputs = model(X, targets=Y)
-
-            # 基础语言模型损失
-            loss = outputs.loss / args.accumulation_steps
-
-            # 应用loss mask（只计算非padding部分的损失）
-            if loss is not None:
-                loss_mask_flat = loss_mask.view(-1)
-                loss_flat = loss.view(-1)
-                loss = torch.sum(loss_flat * loss_mask_flat) / loss_mask_flat.sum()
-
-        # 反向传播
-        if loss is not None:
+        is_update_step = (
+            pending_steps + 1 == args.accumulation_steps
+            or step + 1 == iter_per_epoch
+        )
+        sync_context = (
+            model.no_sync()
+            if ddp and not is_update_step
+            else nullcontext()
+        )
+        with sync_context:
+            with ctx:
+                outputs = model(input_ids=input_ids)
+                unscaled_loss = masked_language_model_loss(
+                    outputs.logits,
+                    targets,
+                    loss_mask,
+                    outputs.aux_loss,
+                )
+                loss = unscaled_loss / args.accumulation_steps
             scaler.scale(loss).backward()
+        pending_steps += 1
 
-        # 梯度累积
-        if (step + 1) % args.accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        is_update_step = pending_steps == args.accumulation_steps
+        is_last_step = step + 1 == iter_per_epoch
+        if is_update_step or is_last_step:
+            # The final partial accumulation window has fewer contributions.
+            optimizer_step(args.accumulation_steps / pending_steps)
+            pending_steps = 0
 
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-
-        # 日志记录
+        processed_batches += 1
+        processed_tokens += input_ids.numel() * (dist.get_world_size() if ddp else 1)
         if step % args.log_interval == 0:
-            spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps if loss is not None else 0.0
-            current_lr = optimizer.param_groups[-1]['lr']
-
-            # 获取当前层类型分布
-            layer_types_str = ", ".join([
-                f"L{i}:{config.layer_types[i][:3]}"
-                for i in range(min(4, config.n_layers))
-            ]) + "..." if config.n_layers > 4 else ""
-
-            Logger(
-                f'Epoch:[{epoch}/{args.epochs}]({step}/{iter_per_epoch}) '
-                f'loss:{current_loss:.3f} '
-                f'lr:{current_lr:.7f} '
-                f'layers:[{layer_types_str}] '
-                f'Time:{spend_time / (step + 1) * (iter_per_epoch - step) / 60:.1f}min'
+            elapsed = time.time() - start_time
+            remaining_minutes = elapsed / processed_batches * (iter_per_epoch - step - 1) / 60
+            tokens_per_second = processed_tokens / elapsed
+            log(
+                f"epoch={epoch + 1}/{args.epochs} step={step + 1}/{iter_per_epoch} "
+                f"loss={unscaled_loss.item():.4f} lr={lr:.7f} "
+                f"tok/s={tokens_per_second:.0f} eta={remaining_minutes:.1f}m"
             )
-
-            if wandb is not None and (not ddp or dist.get_rank() == 0):
+            if wandb is not None and is_primary_process():
                 wandb.log({
-                    "loss": current_loss,
-                    "lr": current_lr,
+                    "loss": unscaled_loss.item(),
+                    "lr": lr,
+                    "tokens_per_second": tokens_per_second,
                     "epoch": epoch,
                     "step": global_step,
                 })
 
-        # 定期保存（覆盖写，只保留最新）
-        if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
-            save_snapshot(epoch)
-
-
-def save_snapshot(epoch):
-    """定期保存模型快照（覆盖写，固定文件名）"""
-    model.eval()
-    moe_path = '_moe' if config.use_moe else ''
-    linear_path = '_linear' if config.use_linear_attn else ''
-    ckpt_path = os.path.join(args.save_dir, f'mindlm_pretrain_{config.dim}{moe_path}{linear_path}.pth')
-
-    if isinstance(model, DistributedDataParallel):
-        state_dict = model.module.state_dict()
-    else:
-        state_dict = model.state_dict()
-
-    torch.save(state_dict, ckpt_path)
-    Logger(f'💾 快照已保存: {ckpt_path}')
-    model.train()
-
-
-def save_checkpoint(epoch):
-    """每轮结束保存完整检查点（带 epoch 编号）"""
-    model.eval()
-    moe_path = '_moe' if config.use_moe else ''
-    linear_path = '_linear' if config.use_linear_attn else ''
-    ckpt_path = os.path.join(args.save_dir, f'mindlm_pretrain_{config.dim}{moe_path}{linear_path}_epoch{epoch}.pth')
-
-    if isinstance(model, DistributedDataParallel):
-        state_dict = model.module.state_dict()
-    else:
-        state_dict = model.state_dict()
-
-    torch.save(state_dict, ckpt_path)
-    Logger(f'💾 模型已保存: {ckpt_path}')
-    model.train()
-
-
-def init_model():
-    """初始化模型和tokenizer"""
-    def count_parameters(model):
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    # 加载MindLM分词器
-    tokenizer_path = args.tokenizer_path or str(project_root / 'MindLM/mindlm_tokenizer')
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-
-    # 确保vocab_size和pad_token_id匹配
-    if config.vocab_size != len(tokenizer):
-        Logger(f'⚠️ 警告: config.vocab_size({config.vocab_size}) != tokenizer.vocab_size({len(tokenizer)})')
-        Logger(f'自动调整为tokenizer.vocab_size')
-        config.vocab_size = len(tokenizer)
-    if tokenizer.pad_token_id is not None:
-        config.pad_token_id = tokenizer.pad_token_id
-
-    # 创建模型
-    model = MindLM(config).to(args.device)
-
-    # 打印模型信息
-    total_params = count_parameters(model)
-    Logger(f'🧠 MindLM模型配置:')
-    Logger(f'   - 总层数: {config.n_layers}')
-    Logger(f'   - 隐藏维度: {config.dim}')
-    Logger(f'   - 注意力头数: {config.n_heads}')
-    Logger(f'   - 层类型分布: {config.layer_types}')
-    Logger(f'   - 使用MoE: {config.use_moe}')
-    if config.use_moe:
-        Logger(f'   - 路由专家数: {config.n_routed_experts}')
-        Logger(f'   - 每token选择专家数: {config.num_experts_per_tok}')
-    Logger(f'   - 使用Linear Attention: {config.use_linear_attn}')
-    Logger(f'💪 总参数量: {total_params / 1e6:.3f} 百万')
-
-    return model, tokenizer
+        if (
+            args.save_interval > 0
+            and (step + 1) % args.save_interval == 0
+            and pending_steps == 0
+            and is_primary_process()
+        ):
+            save_checkpoint(epoch, step, epoch_complete=False)
 
 
 def init_distributed_mode():
-    """初始化分布式训练"""
     if not ddp:
-        return
+        return args.device
 
-    global ddp_local_rank, DEVICE
-
+    if not torch.cuda.is_available():
+        raise RuntimeError("Distributed training currently requires CUDA/NCCL.")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = f"cuda:{local_rank}"
+    torch.cuda.set_device(device)
     dist.init_process_group(backend="nccl")
-    ddp_rank = int(os.environ["RANK"])
-    ddp_local_rank = int(os.environ["LOCAL_RANK"])
-    ddp_world_size = int(os.environ["WORLD_SIZE"])
-    DEVICE = f"cuda:{ddp_local_rank}"
-    torch.cuda.set_device(DEVICE)
-    Logger(f'🚀 DDP模式启动: rank={ddp_rank}, local_rank={ddp_local_rank}, world_size={ddp_world_size}')
+    return device
 
 
-def print_architecture_info():
-    """打印架构信息"""
-    Logger("\n" + "="*60)
-    Logger("🎯 MindLM 架构配置")
-    Logger("="*60)
+def parse_args():
+    parser = argparse.ArgumentParser(description="MindLM pretraining")
+    parser.add_argument("--out_dir", default="out", help="Checkpoint directory")
+    parser.add_argument("--data_path", default="data/pretrain_data.csv", help="CSV containing a text column")
+    parser.add_argument(
+        "--packed_data_prefix",
+        default=None,
+        help="Prefix of <prefix>.bin/.json from prepare_pretrain_data.py; overrides --data_path",
+    )
+    parser.add_argument("--tokenizer_path", default=None)
+    parser.add_argument("--model_config", choices=("mindlm_0.1b", "mindlm_0.1b_moe", "mindlm_0.7b"), default="mindlm_0.1b")
+    parser.add_argument("--resume_from", default=None, help="Legacy state dict or MindLM checkpoint")
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--learning_rate", type=float, default=2e-4)
+    parser.add_argument("--accumulation_steps", type=int, default=8)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--warmup_iters", type=int, default=100)
+    parser.add_argument("--log_interval", type=int, default=100)
+    parser.add_argument("--save_interval", type=int, default=1000)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument("--no_persistent_workers", action="store_true")
+    parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
+    parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--ddp", action="store_true", help="Expected when launched through torchrun")
+    parser.add_argument("--ddp_bucket_cap_mb", type=int, default=100)
+    parser.add_argument("--ddp_static_graph", action="store_true")
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--wandb_project", default="MindLM-Pretrain")
+    parser.add_argument("--wandb_run_name", default=None)
+    parsed = parser.parse_args()
+    if parsed.tokenizer_path is None:
+        parsed.tokenizer_path = str(
+            REPOSITORY_ROOT / ("qwen3_tokenizer" if parsed.model_config == "mindlm_0.7b" else "mindlm_tokenizer")
+        )
+    if parsed.prefetch_factor < 1:
+        raise ValueError("prefetch_factor must be positive")
+    if parsed.ddp_bucket_cap_mb < 1:
+        raise ValueError("ddp_bucket_cap_mb must be positive")
+    return parsed
 
-    # 统计各层类型数量
-    attn_count = config.layer_types.count("attention")
-    linear_count = config.layer_types.count("linear_attention")
-
-    Logger(f"总层数: {config.n_layers}")
-    Logger(f"标准Attention层: {attn_count}")
-    Logger(f"Linear Attention层: {linear_count}")
-    Logger(f"层类型序列: {config.layer_types}")
-
-    if config.use_moe:
-        Logger(f"\nMoE配置:")
-        Logger(f"  - 路由专家数: {config.n_routed_experts}")
-        Logger(f"  - 每token选择专家数: {config.num_experts_per_tok}")
-        Logger(f"  - 共享专家数: {config.n_shared_experts}")
-        Logger(f"  - 辅助损失系数: {config.aux_loss_alpha}")
-
-    Logger("="*60 + "\n")
-
-
-# ==================== 主程序入口 ====================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MindLM Pretraining")
+    args = parse_args()
+    if args.accumulation_steps < 1:
+        raise ValueError("accumulation_steps must be positive")
 
-    # 基础配置
-    parser.add_argument("--out_dir", type=str, default="out", help="输出目录")
-    parser.add_argument("--epochs", type=int, default=5, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=64, help="批次大小")
-    parser.add_argument("--learning_rate", type=float, default=2e-4, help="学习率")
-    parser.add_argument("--device", type=str,
-                        default="cuda:0" if torch.cuda.is_available() else "cpu",
-                        help="计算设备")
-    parser.add_argument("--dtype", type=str, default="bfloat16",
-                        choices=["float16", "bfloat16", "float32"],
-                        help="数据类型")
-    parser.add_argument("--resume_from", type=str, default=None,
-                        help="续训权重路径")
-    parser.add_argument("--max_seq_len", type=int, default=None,
-                        help="最大序列长度（默认576，适合0.5B模型；1B模型建议1024）")
-    # 数据配置
-    parser.add_argument("--data_path", type=str,
-                        default="data/pretrain_data.csv",
-                        help="训练数据路径")
-    parser.add_argument("--tokenizer_path", type=str, default=None,
-                        help="Tokenizer路径（默认使用MindLM分词器）")
-    parser.add_argument("--num_workers", type=int, default=4,
-                        help="数据加载线程数")
-    
-    # 模型架构配置
-    parser.add_argument("--model_config", type=str, default="mindlm_0.5b",
-                        help="模型配置名， 从config目录加载json")
+    ddp = "RANK" in os.environ
+    if args.ddp and not ddp:
+        raise ValueError("--ddp requires launching with torchrun")
+    args.device = init_distributed_mode()
+    device_type = "cuda" if str(args.device).startswith("cuda") else "cpu"
+    ctx = nullcontext() if device_type == "cpu" or args.dtype == "float32" else torch.autocast(device_type=device_type, dtype=getattr(torch, args.dtype))
 
-    # 训练优化配置
-    parser.add_argument("--accumulation_steps", type=int, default=8,
-                        help="梯度累积步数")
-    parser.add_argument("--grad_clip", type=float, default=1.0,
-                        help="梯度裁剪阈值")
-    parser.add_argument("--warmup_iters", type=int, default=100,
-                        help="warmup步数")
-    parser.add_argument("--log_interval", type=int, default=100,
-                        help="日志记录间隔")
-    parser.add_argument("--save_interval", type=int, default=1000,
-                        help="模型保存间隔")
-
-    # 分布式训练
-    parser.add_argument("--ddp", action="store_true",
-                        help="启用DistributedDataParallel")
-    parser.add_argument("--local_rank", type=int, default=-1,
-                        help="分布式训练的local rank")
-
-    # 编译优化
-    parser.add_argument("--compile", action="store_true",
-                        help="启用torch.compile优化（默认关闭，可能导致编译卡住）")
-
-    # wandb配置
-    parser.add_argument("--use_wandb", action="store_true",
-                        help="使用Weights & Biases记录训练")
-    parser.add_argument("--wandb_project", type=str, default="MindLM-Pretrain",
-                        help="wandb项目名称")
-    parser.add_argument("--wandb_run_name", type=str, default=None,
-                        help="wandb运行名称")
-
-    args = parser.parse_args()
-
-    # 创建输出目录
-    args.save_dir = os.path.join(args.out_dir)
-    os.makedirs(args.save_dir, exist_ok=True)
-
-    # 设置随机种子
     torch.manual_seed(1337)
+    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
-    # 设备类型
-    device_type = "cuda" if "cuda" in args.device else "cpu"
-
-    # 自动混合精度上下文
-    ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(
-        dtype=getattr(torch, args.dtype)
-    )
-
-    # 检测DDP模式
-    ddp = int(os.environ.get("RANK", -1)) != -1
-    ddp_local_rank, DEVICE = 0, args.device
-
-    if ddp:
-        init_distributed_mode()
-        args.device = torch.device(DEVICE)
-
-    # 创建MindLM配置
-    if args.model_config:
-        # 从JSON配置文件加载模型架构
-        model_config_dict = load_config(args.model_config)
-        Logger(f'加载模型配置: config/{args.model_config}.json')
-        config = MindLMConfig(                                                                                                                    
-            dim=model_config_dict['dim'],                                                                                                         
-            n_layers=model_config_dict['n_layers'],                                                                                               
-            n_heads=model_config_dict['n_heads'],                                                                                                 
-            n_kv_heads=model_config_dict['n_kv_heads'],                                                                                           
-            vocab_size=model_config_dict['vocab_size'],                                                                                           
-            max_seq_len=model_config_dict['max_seq_len'],                                                                                         
-            dropout=model_config_dict.get('dropout', 0.0),                                                                                        
-            norm_eps=model_config_dict.get('norm_eps', 1e-6),                                                                                     
-            hidden_dim=model_config_dict.get('hidden_dim'),                                                                                       
-            multiple_of=model_config_dict.get('multiple_of', 256),                                                                                
-            use_moe=model_config_dict.get('use_moe', False),                                                                                      
-            n_routed_experts=model_config_dict.get('n_routed_experts', 4),                                                                        
-            num_experts_per_tok=model_config_dict.get('num_experts_per_tok', 2),                                                                  
-            n_shared_experts=model_config_dict.get('n_shared_experts', 1),                                                                        
-            scoring_func='softmax',                                                                                                               
-            aux_loss_alpha=model_config_dict.get('aux_loss_alpha', 0.01),                                                                         
-            seq_aux=True,                                                                                                                         
-            norm_topk_prob=True,                                                                                                                  
-            use_linear_attn=model_config_dict.get('use_linear_attn', True),                                                                       
-            layer_types=model_config_dict.get('layer_types'),                                                                                     
-            conv_kernel_size=model_config_dict.get('conv_kernel_size', 4),                                                                        
-        ) 
-    else:
-        Logger(f'加载默认模型配置: MindLMConfig')
-        config = MindLMConfig()
-
-    if args.max_seq_len is not None:
-        config.max_seq_len = args.max_seq_len
-        Logger(f'⚡ 使用命令行指定的最大序列长度: {config.max_seq_len}')
-        
-    # 打印架构信息
-    print_architecture_info()
-
-    # wandb初始化
-    if args.use_wandb and (not ddp or dist.get_rank() == 0):
-        import wandb
-        wandb_run_name = args.wandb_run_name or (
-            f"MindLM-D{config.dim}-L{config.n_layers}-H{config.n_heads}-"
-            f"MoE{config.n_routed_experts if config.use_moe else 0}-"
-            f"Linear{config.use_linear_attn}"
-        )
-        wandb.init(project=args.wandb_project, name=wandb_run_name, config=vars(args))
-    else:
-        wandb = None
-
-    # 初始化模型和tokenizer
-    model, tokenizer = init_model()
-    
-    # 加载续训权重
-    if args.resume_from:
-        Logger(f"加载续训权重: {args.resume_from}")
-        state_dict = torch.load(args.resume_from, map_location=args.device)
-        # 处理DDP的module，前缀
-        if any(k.startswith("module.") for k in state_dict.keys()):
-            state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
-        model.load_state_dict(state_dict, strict=False)
-        Logger("续训权重加载成功!")
-
-    # 加载数据
-    Logger(f'📂 加载训练数据: {args.data_path}')
-    df = pd.read_csv(args.data_path)
-    df = df.sample(frac=1.0)  # 打乱
-    train_ds = PretrainDataset(df, tokenizer, max_length=config.max_seq_len)
-
-    # 创建DataLoader
-    train_sampler = DistributedSampler(train_ds) if ddp else None
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        pin_memory=True,
-        drop_last=False,
-        shuffle=(train_sampler is None),
-        num_workers=args.num_workers,
-        sampler=train_sampler
-    )
-
-    Logger(f'📊 数据集大小: {len(train_ds)}, 批次数量: {len(train_loader)}')
-
-    # 优化器和梯度缩放器
-    # bfloat16 不需要 GradScaler，只有 float16 需要
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
+    config = build_model_config(args.model_config, tokenizer)
+    model = MindLM(config).to(args.device)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.1)
+    scaler = torch.amp.GradScaler(device_type, enabled=args.dtype == "float16" and device_type == "cuda")
 
-    # torch.compile加速（Linux + PyTorch 2.0+）
-    if args.compile and platform.system() != 'Windows' and float(torch.__version__.split('.')[0]) >= 2:
-        Logger("⚡ 启用torch.compile优化...")
+    resume_metadata = {}
+    if args.resume_from:
+        resume_metadata = load_model_checkpoint(model, args.resume_from, args.device)
+        if resume_metadata.get("training_stage") not in (None, "pretrain"):
+            raise ValueError("Pretraining can only resume a pretraining checkpoint.")
+        if resume_metadata.get("optimizer"):
+            optimizer.load_state_dict(resume_metadata["optimizer"])
+        if resume_metadata.get("scaler"):
+            scaler.load_state_dict(resume_metadata["scaler"])
+        log(f"Loaded checkpoint: {args.resume_from}")
+
+    if args.compile:
         model = torch.compile(model)
-
-    # DDP包装
     if ddp:
-        model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
+        model = DistributedDataParallel(
+            model,
+            device_ids=[int(os.environ["LOCAL_RANK"])],
+            broadcast_buffers=False,
+            gradient_as_bucket_view=True,
+            bucket_cap_mb=args.ddp_bucket_cap_mb,
+            # Routed MoE experts can be unused on an individual rank for a
+            # batch. Dense configurations keep the faster default path.
+            find_unused_parameters=config.use_moe,
+            static_graph=args.ddp_static_graph and not config.use_moe,
+        )
 
-    # 开始训练
+    if args.packed_data_prefix:
+        train_dataset = PackedPretrainDataset(
+            args.packed_data_prefix,
+            max_length=config.max_seq_len,
+            tokenizer_vocab_size=len(tokenizer),
+        )
+        log(f"Using packed pretraining data: {args.packed_data_prefix} ({len(train_dataset)} sequences)")
+    else:
+        dataframe = pd.read_csv(args.data_path)
+        if "text" not in dataframe.columns:
+            raise ValueError("Pretraining CSV must contain a 'text' column")
+        train_dataset = PretrainDataset(dataframe, tokenizer, max_length=config.max_seq_len)
+    train_sampler = DistributedSampler(train_dataset, seed=1337) if ddp else EpochRandomSampler(train_dataset)
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "sampler": train_sampler,
+        "num_workers": args.num_workers,
+        "pin_memory": device_type == "cuda",
+    }
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = not args.no_persistent_workers
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
+    train_loader = DataLoader(
+        train_dataset,
+        **loader_kwargs,
+    )
     iter_per_epoch = len(train_loader)
-    Logger(f'🚀 开始训练! 总轮数: {args.epochs}, 每轮迭代: {iter_per_epoch}')
+    if iter_per_epoch == 0:
+        raise ValueError("Pretraining dataset is empty")
 
-    for epoch in range(args.epochs):
-        if ddp:
-            train_sampler.set_epoch(epoch)
-        train_epoch(epoch, wandb)
+    wandb = None
+    if args.use_wandb and is_primary_process():
+        import wandb as wandb_module
 
-        # 每轮结束后保存
-        if not ddp or dist.get_rank() == 0:
-            save_checkpoint(epoch)
+        wandb = wandb_module
+        wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
 
-    Logger('✅ 训练完成!')
+    start_epoch = 0
+    resume_step = 0
+    if resume_metadata:
+        if resume_metadata.get("epoch_complete"):
+            start_epoch = resume_metadata["epoch"] + 1
+        else:
+            start_epoch = resume_metadata.get("epoch", 0)
+            resume_step = resume_metadata.get("step", -1) + 1
+            log(f"Resuming epoch {start_epoch + 1} from batch {resume_step + 1}.")
+
+    global_batch_size = args.batch_size * args.accumulation_steps * (dist.get_world_size() if ddp else 1)
+    log(
+        f"Training {args.model_config}: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M parameters, "
+        f"global_batch={global_batch_size}"
+    )
+    for epoch in range(start_epoch, args.epochs):
+        train_sampler.set_epoch(epoch)
+        train_epoch(epoch, wandb, skip_steps=resume_step if epoch == start_epoch else 0)
+        resume_step = 0
+        if is_primary_process():
+            save_checkpoint(epoch, iter_per_epoch - 1, epoch_complete=True)
 
     if wandb is not None:
         wandb.finish()
+    if ddp:
+        dist.destroy_process_group()

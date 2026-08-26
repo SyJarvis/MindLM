@@ -14,10 +14,10 @@ sys.path.insert(0, str(project_root))
 
 from transformers import AutoTokenizer
 from modeling_mindlm import MindLM, MindLMConfig
-from config import load_config
+from training_utils import build_model_config, load_model_checkpoint
 
 
-def export_model(config_name, checkpoint_path, output_dir, dtype="bfloat16"):
+def export_model(config_name, checkpoint_path, output_dir, dtype="bfloat16", tokenizer_path=None):
     """
     导出模型为 HuggingFace transformers 格式
 
@@ -31,39 +31,18 @@ def export_model(config_name, checkpoint_path, output_dir, dtype="bfloat16"):
     torch_dtype = getattr(torch, dtype)
 
     # 1. 加载配置
-    model_config_dict = load_config(config_name)
     print(f"模型配置: {config_name}")
 
-    # 2. 加载 tokenizer
-    tokenizer_path = str(project_root / "mindlm_tokenizer")
+    # 2. 加载与模型词表匹配的 tokenizer
+    if tokenizer_path is None:
+        tokenizer_path = str(
+            project_root / ("qwen3_tokenizer" if config_name == "mindlm_0.7b" else "mindlm_tokenizer")
+        )
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-    model_config_dict['vocab_size'] = len(tokenizer)
     print(f"Tokenizer 词表大小: {len(tokenizer)}")
 
     # 3. 创建模型
-    config = MindLMConfig(
-        dim=model_config_dict['dim'],
-        n_layers=model_config_dict['n_layers'],
-        n_heads=model_config_dict['n_heads'],
-        n_kv_heads=model_config_dict['n_kv_heads'],
-        vocab_size=model_config_dict['vocab_size'],
-        max_seq_len=model_config_dict['max_seq_len'],
-        dropout=0.0,
-        norm_eps=model_config_dict.get('norm_eps', 1e-6),
-        hidden_dim=model_config_dict.get('hidden_dim'),
-        multiple_of=model_config_dict.get('multiple_of', 256),
-        use_moe=model_config_dict.get('use_moe', False),
-        n_routed_experts=model_config_dict.get('n_routed_experts', 4),
-        num_experts_per_tok=model_config_dict.get('num_experts_per_tok', 2),
-        n_shared_experts=model_config_dict.get('n_shared_experts', 1),
-        scoring_func='softmax',
-        aux_loss_alpha=model_config_dict.get('aux_loss_alpha', 0.01),
-        seq_aux=True,
-        norm_topk_prob=True,
-        use_linear_attn=model_config_dict.get('use_linear_attn', True),
-        layer_types=model_config_dict.get('layer_types'),
-        conv_kernel_size=model_config_dict.get('conv_kernel_size', 4),
-    )
+    config = build_model_config(config_name, tokenizer)
 
     # 注册 auto class，使 transformers 能自动识别
     MindLMConfig.register_for_auto_class()
@@ -73,16 +52,7 @@ def export_model(config_name, checkpoint_path, output_dir, dtype="bfloat16"):
 
     # 4. 加载权重
     print(f"加载权重: {checkpoint_path}")
-    state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
-
-    # 兼容完整 checkpoint 和纯 state_dict
-    if isinstance(state_dict, dict) and 'model' in state_dict:
-        state_dict = state_dict['model']
-    # 兼容 DDP 的 module. 前缀
-    if any(k.startswith('module.') for k in state_dict.keys()):
-        state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
-
-    model.load_state_dict(state_dict, strict=False)
+    load_model_checkpoint(model, checkpoint_path, device)
     print("权重加载成功")
 
     # 5. 转换精度
@@ -110,7 +80,7 @@ def export_model(config_name, checkpoint_path, output_dir, dtype="bfloat16"):
     # 复制模型代码文件（transformers trust_remote_code 需要这些文件）
     import shutil
     src_dir = Path(__file__).parent
-    for fname in ["modeling_mindlm.py", "config.py"]:
+    for fname in ["modeling_mindlm.py"]:
         src = src_dir / fname
         if src.exists():
             shutil.copy2(src, os.path.join(output_dir, fname))
@@ -146,56 +116,17 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="MindLM 模型导出")
-    parser.add_argument("--config", type=str, default="mindlm_0.1b",
+    parser.add_argument("--config", choices=("mindlm_0.1b", "mindlm_0.1b_moe", "mindlm_0.7b"), default="mindlm_0.1b",
                         help="模型配置名")
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="权重文件路径 (.pth)")
     parser.add_argument("--output_dir", type=str, required=True,
                         help="输出目录")
+    parser.add_argument("--tokenizer_path", type=str, default=None,
+                        help="Tokenizer 目录；默认按模型配置选择")
     parser.add_argument("--dtype", type=str, default="bfloat16",
                         choices=["bfloat16", "float16", "float32"],
                         help="权重精度")
     args = parser.parse_args()
 
-    export_model(args.config, args.checkpoint, args.output_dir, args.dtype)
-# ```
-
-# ## 用法
-
-# ```bash
-# # 导出预训练模型
-# python export_model.py \
-#     --checkpoint out/mindlm_pretrain_768_linear_epoch0.pth \
-#     --output_dir mindlm-0.1b \
-#     --dtype bfloat16
-
-# # 导出 SFT 模型
-# python export_model.py \
-#     --checkpoint out/mindlm_sft_768_linear_epoch0.pth \
-#     --output_dir mindlm-0.1b-sft \
-#     --dtype bfloat16
-# ```
-
-# ## 导出后的目录结构
-
-# ```
-# mindlm-0.1b/
-# ├── config.json              # 模型配置 (transformers 格式)
-# ├── model.safetensors        # 模型权重 (safetensors 格式)
-# ├── tokenizer.json           # tokenizer
-# ├── tokenizer_config.json    # tokenizer 配置
-# ├── vocab.json               # 词表
-# ├── merges.txt               # BPE 合并规则
-# └── special_tokens_map.json  # 特殊 token
-# ```
-
-# ## 使用方式
-
-# ```python
-# from transformers import AutoModelForCausalLM, AutoTokenizer
-
-# model = AutoModelForCausalLM.from_pretrained("mindlm-0.1b", trust_remote_code=True)
-# tokenizer = AutoTokenizer.from_pretrained("mindlm-0.1b", trust_remote_code=True)
-# ```
-
-# 关键点：`trust_remote_code=True` 是必须的，因为 MindLM 的架构是自定义的，transformers 需要从仓库中加载 `modeling_mindlm.py`。所以导出目录里需要放一份 `modeling_mindlm.py` 和 `config.py`。脚本里需要我加上自动复制这两个文件的逻辑吗？
+    export_model(args.config, args.checkpoint, args.output_dir, args.dtype, args.tokenizer_path)

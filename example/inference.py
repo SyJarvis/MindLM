@@ -1,12 +1,9 @@
-"""
-MindLM 推理示例
-使用 transformers 库加载 mindlm_1b_sft 模型进行对话推理
-"""
+"""Load an exported MindLM model and run a chat turn."""
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-MODEL_PATH = "./mindlm_1b_sft"
+MODEL_PATH = "./mindlm-0.1b-sft"
 
 
 def load_model(model_path=MODEL_PATH, device="cpu"):
@@ -28,28 +25,14 @@ def chat(model, tokenizer, messages, max_new_tokens=256, temperature=0.7, top_k=
     eos_token_id = tokenizer.convert_tokens_to_ids("</s>")
 
     with torch.inference_mode():
-        generated = inputs["input_ids"]
-        for _ in range(max_new_tokens):
-            outputs = model(generated)
-            logits = outputs.logits[:, -1, :]
-
-            if temperature > 0:
-                logits = logits / temperature
-                if top_k is not None:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = float("-inf")
-                logits = logits.nan_to_num(posinf=0.0, neginf=0.0)
-                probs = torch.softmax(logits, dim=-1)
-                probs = torch.clamp(probs, min=0.0)
-                probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-10)
-                next_token = torch.multinomial(probs, num_samples=1)
-                print
-            else:
-                next_token = logits.argmax(dim=-1, keepdim=True)
-
-            if next_token.item() == eos_token_id:
-                break
-            generated = torch.cat([generated, next_token], dim=1)
+        generated = model.generate(
+            input_ids=inputs["input_ids"],
+            eos_token_id=eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+        )
 
     response = tokenizer.decode(generated[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
     return response

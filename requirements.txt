@@ -10,6 +10,7 @@ peft==0.18.1
 # Data & NLP
 numpy==2.2.6
 pandas==2.3.3
+pyarrow==21.0.0
 scikit_learn==1.8.0
 jieba==0.42.1
 nltk==3.8
