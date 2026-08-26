@@ -1,4 +1,6 @@
 import ast
+import json
+from pathlib import Path
 
 import pandas as pd
 import numpy as np
@@ -40,6 +42,78 @@ class PretrainDataset(Dataset):
         Y = np.array(input_id[1:]).astype(np.int64)
         loss_mask = np.array(loss_mask[1:]).astype(np.int64)
         return torch.from_numpy(X), torch.from_numpy(Y), torch.from_numpy(loss_mask)
+
+
+class PackedPretrainDataset(Dataset):
+    """Memory-map fixed-length, EOS-delimited pretraining token blocks.
+
+    ``prepare_pretrain_data.py`` writes ``<prefix>.bin`` and ``<prefix>.json``.
+    Every stored record has ``max_length + 1`` real tokens, so this dataset avoids
+    padding and its loss mask is always one. It is intended for pretraining only;
+    answer-only SFT masking remains in ``SFTDataset``.
+    """
+
+    FORMAT = "mindlm_packed_pretrain_v1"
+
+    def __init__(self, prefix, max_length, tokenizer_vocab_size=None):
+        super().__init__()
+        prefix = Path(prefix)
+        self.tokens_path = prefix.with_suffix(".bin")
+        metadata_path = prefix.with_suffix(".json")
+        if not self.tokens_path.is_file():
+            raise FileNotFoundError(f"Packed token file not found: {self.tokens_path}")
+        if not metadata_path.is_file():
+            raise FileNotFoundError(f"Packed metadata file not found: {metadata_path}")
+
+        with metadata_path.open("r", encoding="utf-8") as file:
+            metadata = json.load(file)
+        if metadata.get("format") != self.FORMAT:
+            raise ValueError(f"Unsupported packed dataset format in {metadata_path}")
+        if metadata.get("sequence_length") != max_length:
+            raise ValueError(
+                f"Packed sequence length is {metadata.get('sequence_length')}, "
+                f"but the model requires {max_length}."
+            )
+        if tokenizer_vocab_size is not None and metadata.get("tokenizer_vocab_size") != tokenizer_vocab_size:
+            raise ValueError(
+                "Packed dataset tokenizer vocabulary does not match the selected tokenizer: "
+                f"{metadata.get('tokenizer_vocab_size')} != {tokenizer_vocab_size}."
+            )
+
+        self.max_length = max_length
+        self.tokens_per_record = metadata.get("tokens_per_record")
+        self.num_sequences = metadata.get("num_sequences")
+        dtype = np.dtype(metadata.get("dtype", "uint32"))
+        if self.tokens_per_record != max_length + 1:
+            raise ValueError("Packed dataset record width must be max_length + 1")
+        if not isinstance(self.num_sequences, int) or self.num_sequences < 1:
+            raise ValueError("Packed dataset contains no full token sequences")
+        expected_bytes = self.num_sequences * self.tokens_per_record * dtype.itemsize
+        if self.tokens_path.stat().st_size != expected_bytes:
+            raise ValueError(
+                f"Packed token file size does not match metadata: expected {expected_bytes}, "
+                f"got {self.tokens_path.stat().st_size}."
+            )
+
+        self.metadata = metadata
+        self.tokens = np.memmap(
+            self.tokens_path,
+            mode="r",
+            dtype=dtype,
+            shape=(self.num_sequences, self.tokens_per_record),
+        )
+        self.loss_mask = torch.ones(max_length, dtype=torch.int64)
+
+    def __len__(self):
+        return self.num_sequences
+
+    def __getitem__(self, index: int):
+        record = self.tokens[index]
+        # Copy before converting because a read-only memmap cannot safely back a
+        # mutable torch Tensor in a DataLoader worker.
+        input_ids = torch.from_numpy(np.asarray(record[:-1], dtype=np.int64).copy())
+        targets = torch.from_numpy(np.asarray(record[1:], dtype=np.int64).copy())
+        return input_ids, targets, self.loss_mask
 
 
 class SFTDataset(Dataset):

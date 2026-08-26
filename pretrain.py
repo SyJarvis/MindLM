@@ -15,7 +15,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
 
-from dataset import PretrainDataset
+from dataset import PackedPretrainDataset, PretrainDataset
 from modeling_mindlm import MindLM
 from training_utils import (
     build_model_config,
@@ -166,6 +166,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="MindLM pretraining")
     parser.add_argument("--out_dir", default="out", help="Checkpoint directory")
     parser.add_argument("--data_path", default="data/pretrain_data.csv", help="CSV containing a text column")
+    parser.add_argument(
+        "--packed_data_prefix",
+        default=None,
+        help="Prefix of <prefix>.bin/.json from prepare_pretrain_data.py; overrides --data_path",
+    )
     parser.add_argument("--tokenizer_path", default=None)
     parser.add_argument("--model_config", choices=("mindlm_0.1b", "mindlm_0.1b_moe", "mindlm_0.7b"), default="mindlm_0.1b")
     parser.add_argument("--resume_from", default=None, help="Legacy state dict or MindLM checkpoint")
@@ -236,10 +241,18 @@ if __name__ == "__main__":
             find_unused_parameters=config.use_moe,
         )
 
-    dataframe = pd.read_csv(args.data_path)
-    if "text" not in dataframe.columns:
-        raise ValueError("Pretraining CSV must contain a 'text' column")
-    train_dataset = PretrainDataset(dataframe, tokenizer, max_length=config.max_seq_len)
+    if args.packed_data_prefix:
+        train_dataset = PackedPretrainDataset(
+            args.packed_data_prefix,
+            max_length=config.max_seq_len,
+            tokenizer_vocab_size=len(tokenizer),
+        )
+        log(f"Using packed pretraining data: {args.packed_data_prefix} ({len(train_dataset)} sequences)")
+    else:
+        dataframe = pd.read_csv(args.data_path)
+        if "text" not in dataframe.columns:
+            raise ValueError("Pretraining CSV must contain a 'text' column")
+        train_dataset = PretrainDataset(dataframe, tokenizer, max_length=config.max_seq_len)
     train_sampler = DistributedSampler(train_dataset, seed=1337) if ddp else EpochRandomSampler(train_dataset)
     train_loader = DataLoader(
         train_dataset,

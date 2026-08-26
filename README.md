@@ -78,6 +78,16 @@ For the 0.7B design, use `--model_config mindlm_0.7b`; it defaults to the copied
 `qwen3_tokenizer/` directory. Older 0.1B checkpoints continue to use
 `mindlm_tokenizer/`. Pass `--tokenizer_path` to override either default.
 
+For 0.7B pretraining, pack variable-length source text into fixed token blocks before
+launching a long run. This removes short-sample padding from the training hot path:
+
+```bash
+python prepare_pretrain_data.py \
+  --input_csv data/pretrain_data.csv \
+  --output_prefix data/packed_qwen3_4096 \
+  --max_seq_len 4096
+```
+
 Train the MoE variant:
 
 ```bash
@@ -102,7 +112,7 @@ batch size 为 `GPU 数 x batch_size x accumulation_steps`。例如 4 张卡训�
 torchrun --nproc_per_node=4 pretrain.py \
   --ddp \
   --model_config mindlm_0.7b \
-  --data_path data/pretrain_data.csv \
+  --packed_data_prefix data/packed_qwen3_4096 \
   --batch_size 2 \
   --accumulation_steps 8 \
   --dtype bfloat16
