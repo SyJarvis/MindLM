@@ -1,15 +1,19 @@
 """Small CPU smoke tests for the supported MindLM training contracts."""
 
+import json
 import tempfile
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
 try:
+    import numpy as np
     import pandas as pd
     import torch
 
-    from dataset import SFTDataset
-    from modeling_mindlm import MindLM, MindLMConfig
+    import modeling_mindlm
+    from dataset import PackedPretrainDataset, SFTDataset
+    from modeling_mindlm import GatedDeltaNet, MindLM, MindLMConfig, l2norm
     from training_utils import (
         extract_model_state,
         masked_language_model_loss,
@@ -52,6 +56,12 @@ class MindLMSmokeTest(unittest.TestCase):
         self.assertEqual(tuple(moe_output.logits.shape), (2, 6, 32))
         self.assertIsNotNone(moe_output.aux_loss)
         self.assertGreaterEqual(moe_output.aux_loss.item(), 0.0)
+
+        full_config = self.make_config()
+        full_config.linear_attn_impl = "gated_delta_rule"
+        full = MindLM(full_config).eval()
+        full_output = full(input_ids=input_ids)
+        self.assertEqual(tuple(full_output.logits.shape), (2, 6, 32))
 
     def test_masked_loss_and_context_limited_generation(self):
         logits = torch.tensor([[[2.0, 0.0], [0.0, 2.0]]])
@@ -107,6 +117,100 @@ class MindLMSmokeTest(unittest.TestCase):
         _input_ids, _targets, loss_mask = dataset[0]
         self.assertEqual(tuple(loss_mask.shape), (5,))
         self.assertEqual(loss_mask.tolist(), [0, 1, 1, 1, 1])
+
+    def test_packed_pretrain_dataset_reads_padding_free_token_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = f"{directory}/packed"
+            records = np.array([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]], dtype=np.uint32)
+            records.tofile(f"{prefix}.bin")
+            with open(f"{prefix}.json", "w", encoding="utf-8") as file:
+                json.dump(
+                    {
+                        "format": "mindlm_packed_pretrain_v1",
+                        "dtype": "uint32",
+                        "sequence_length": 4,
+                        "tokens_per_record": 5,
+                        "num_sequences": 2,
+                        "tokenizer_vocab_size": 32,
+                    },
+                    file,
+                )
+
+            dataset = PackedPretrainDataset(prefix, max_length=4, tokenizer_vocab_size=32)
+            input_ids, targets, loss_mask = dataset[1]
+
+        self.assertEqual(len(dataset), 2)
+        self.assertEqual(input_ids.tolist(), [6, 7, 8, 9])
+        self.assertEqual(targets.tolist(), [7, 8, 9, 10])
+        self.assertEqual(loss_mask.tolist(), [1, 1, 1, 1])
+
+    def test_complete_gated_delta_rule_matches_token_recurrence_and_backpropagates(self):
+        config = self.make_config()
+        config.linear_attn_impl = "gated_delta_rule"
+        module = GatedDeltaNet(config).double()
+        batch, length = 2, 5
+        heads, dim = module.num_v_heads, module.head_v_dim
+        query = torch.randn(batch, length, heads, dim, dtype=torch.float64, requires_grad=True)
+        key = torch.randn_like(query, requires_grad=True)
+        value = torch.randn(batch, length, heads, dim, dtype=torch.float64, requires_grad=True)
+        g = -torch.rand(batch, length, heads, dtype=torch.float64)
+        beta = torch.rand(batch, length, heads, dtype=torch.float64)
+
+        actual = module.gated_delta_rule_attention(query, key, value, g, beta, chunk_size=2)
+
+        q_ref = l2norm(query.transpose(1, 2), dim=-1) * (dim ** -0.5)
+        k_ref = l2norm(key.transpose(1, 2), dim=-1)
+        v_ref = value.transpose(1, 2)
+        g_ref = g.transpose(1, 2)
+        b_ref = beta.transpose(1, 2)
+        state = torch.zeros(batch, heads, dim, dim, dtype=torch.float64)
+        expected = []
+        for t in range(length):
+            state = state * torch.exp(g_ref[:, :, t]).unsqueeze(-1).unsqueeze(-1)
+            predicted = torch.einsum("bhd,bhdv->bhv", k_ref[:, :, t], state)
+            residual = b_ref[:, :, t].unsqueeze(-1) * (v_ref[:, :, t] - predicted)
+            state = state + k_ref[:, :, t].unsqueeze(-1) * residual.unsqueeze(-2)
+            expected.append(torch.einsum("bhd,bhdv->bhv", q_ref[:, :, t], state))
+        expected = torch.stack(expected, dim=2).transpose(1, 2)
+
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+        actual.sum().backward()
+        self.assertTrue(torch.isfinite(query.grad).all())
+        self.assertTrue(torch.isfinite(key.grad).all())
+        self.assertTrue(torch.isfinite(value.grad).all())
+
+        first, state = module.gated_delta_rule_attention(
+            query.detach()[:, :3], key.detach()[:, :3], value.detach()[:, :3],
+            g[:, :3], beta[:, :3], chunk_size=2, return_state=True,
+        )
+        second = module.gated_delta_rule_attention(
+            query.detach()[:, 3:], key.detach()[:, 3:], value.detach()[:, 3:],
+            g[:, 3:], beta[:, 3:], initial_state=state, chunk_size=2,
+        )
+        torch.testing.assert_close(torch.cat((first, second), dim=1), actual.detach())
+
+    def test_fla_adapter_receives_the_configured_chunk_size(self):
+        config = self.make_config()
+        config.linear_attn_chunk_size = 32
+        module = GatedDeltaNet(config)
+        shape = (1, 3, module.num_v_heads, module.head_v_dim)
+        query = torch.randn(shape)
+        key = torch.randn(shape)
+        value = torch.randn(shape)
+        g = -torch.rand(shape[:-1])
+        beta = torch.rand(shape[:-1])
+        received = {}
+
+        def fake_fla(q, k, v, gate, beta_value, **kwargs):
+            received.update(kwargs)
+            return q, None
+
+        with mock.patch.object(modeling_mindlm, "_fla_chunk_gdr", fake_fla):
+            output = module.gated_delta_rule_fla(query, key, value, g, beta)
+
+        self.assertEqual(tuple(output.shape), shape)
+        self.assertEqual(received["chunk_size"], 32)
+        self.assertTrue(received["use_qk_l2norm_in_kernel"])
 
 
 if __name__ == "__main__":
