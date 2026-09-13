@@ -872,6 +872,11 @@ class MindLM(PreTrainedModel, GenerationMixin):
                 for name, module in layer.feed_forward.named_modules():
                     if name == 'w2' or name.endswith('.w2'):
                         module._mindlm_residual_projection = True
+            # Transformers may consider freshly constructed submodules
+            # initialized already and skip them inside ``post_init``.  Apply
+            # the V3 scheme explicitly so every Linear/Embedding receives the
+            # intended initialization exactly once.
+            self.apply(self._init_weights)
 
         self.aux_loss = 0.0
         self.post_init()
@@ -887,11 +892,20 @@ class MindLM(PreTrainedModel, GenerationMixin):
                 if getattr(module, 'bias', None) is not None:
                     nn.init.zeros_(module.bias)
             elif isinstance(module, GatedDeltaNet):
+                # ``post_init`` may be called again by callers after model
+                # construction (for example when integrating with
+                # Transformers utilities).  Keep the V3 initialization
+                # idempotent just like the tied embedding/output path above;
+                # re-sampling these recurrent parameters would silently alter
+                # a freshly loaded model.
+                if getattr(module, '_mindlm_v3_initialized', False):
+                    return
                 with torch.no_grad():
                     amplitude = torch.empty_like(module.A_log).uniform_(0, 16).clamp_min_(torch.finfo(module.A_log.dtype).tiny)
                     module.A_log.copy_(amplitude.log())
                     dt = torch.exp(torch.empty_like(module.dt_bias).uniform_(math.log(0.001), math.log(0.1)))
                     module.dt_bias.copy_(dt + torch.log(-torch.expm1(-dt)))
+                module._mindlm_v3_initialized = True
             return
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
