@@ -1,4 +1,9 @@
-"""Interactive or batch chat evaluation for a MindLM SFT checkpoint."""
+"""Batch three-question eval for a MindLM SFT checkpoint (CPU/GPU selectable).
+
+Derived from eval/eval_sft.py with explicit sampling controls: --temperature
+and --top_k are exposed so quality checks are reproducible (low temperature
+reduces sampling variance).
+"""
 
 import argparse
 import sys
@@ -13,12 +18,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from modeling_mindlm import MindLM
 from training_utils import build_model_config, load_model_checkpoint
 
-questions = [
-    "你好，你是谁？",
-    "请介绍一下人工智能。",
-    "如何学习编程？",
-    "太阳系有几大行星？"
-]
 
 def chat(model, tokenizer, messages, device, max_new_tokens=256, temperature=0.7, top_k=8, enable_thinking=False):
     # The Qwen3 template prepends an empty <think></think> block when thinking
@@ -53,17 +52,17 @@ def chat(model, tokenizer, messages, device, max_new_tokens=256, temperature=0.7
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MindLM SFT evaluation")
+    parser = argparse.ArgumentParser(description="MindLM SFT batch eval with sampling controls")
     parser.add_argument("--config", choices=("mindlm_0.1b", "mindlm_0.1b_moe", "mindlm_0.7b"), default="mindlm_0.1b")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--tokenizer_path", default=None)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--interactive", action="store_true")
+    parser.add_argument("--temperature", type=float, default=0.1, help="Sampling temperature (default 0.1 for stable eval)")
+    parser.add_argument("--top_k", type=int, default=8)
+    parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--enable_thinking", action="store_true", help="Let the model generate a <think> block (off by default)")
     args = parser.parse_args()
     if args.tokenizer_path is None:
-        # All MindLM checkpoints so far (pretrain and SFT) use the Qwen3
-        # tokenizer; keep mindlm_tokenizer available via --tokenizer_path.
         args.tokenizer_path = str(PROJECT_ROOT / "qwen3_tokenizer")
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
@@ -71,26 +70,15 @@ def main():
     load_model_checkpoint(model, args.checkpoint, args.device)
     model.eval()
 
-    if not args.interactive:
-        for question in questions:
-            answer = chat(
-                model, tokenizer, [{"role": "user", "content": question}], args.device,
-                enable_thinking=args.enable_thinking,
-            )
-            print(f"用户: {question}\n助手: {answer}\n")
-        return
-
-    history = []
-    while True:
-        user_input = input("用户: ").strip()
-        if user_input.lower() in {"quit", "exit", "q"}:
-            break
-        if not user_input:
-            continue
-        messages = history[-6:] + [{"role": "user", "content": user_input}]
-        answer = chat(model, tokenizer, messages, args.device, enable_thinking=args.enable_thinking)
-        print(f"助手: {answer}\n")
-        history.extend(({"role": "user", "content": user_input}, {"role": "assistant", "content": answer}))
+    for question in ("你好，你是谁？", "请介绍一下人工智能。", "如何学习编程？"):
+        answer = chat(
+            model, tokenizer, [{"role": "user", "content": question}], args.device,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            enable_thinking=args.enable_thinking,
+        )
+        print(f"用户: {question}\n助手: {answer}\n")
 
 
 if __name__ == "__main__":

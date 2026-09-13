@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 CONFIG_DIR = Path(__file__).resolve().parent / "config"
-SUPPORTED_CONFIGS = ("mindlm_0.1b", "mindlm_0.1b_moe", "mindlm_0.7b")
+SUPPORTED_CONFIGS = ("mindlm_0.1b", "mindlm_0.1b_moe", "mindlm_0.7b", "mindlm_0.2b_gdn")
 
 
 def load_config(name: str) -> dict:

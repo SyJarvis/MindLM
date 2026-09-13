@@ -117,6 +117,18 @@ class PackedPretrainDataset(Dataset):
 
 
 class SFTDataset(Dataset):
+    """Chat SFT with assistant-only loss.
+
+    Two CSV schemas are supported:
+      - legacy: ``history, q, a`` columns (q/a become the final exchange)
+      - unified: ``messages`` column holding an OpenAI-style JSON list,
+        rendered verbatim with the tokenizer's chat template
+
+    The chat template must end every assistant turn with the same marker
+    (``<|im_start|>assistant\\n`` for the Qwen3 tokenizer); loss is applied
+    from the final marker up to (and including) the closing ``<|im_end|>``.
+    """
+
     def __init__(self, df, tokenizer, max_length=1024, prompt_max_len=512, answer_max_len=256):
         super().__init__()
         if max_length < 2:
@@ -127,6 +139,7 @@ class SFTDataset(Dataset):
         self.max_length = max_length
         self.prompt_max_len = prompt_max_len
         self.answer_max_len = answer_max_len
+        self.has_messages_column = "messages" in getattr(df, "columns", [])
         self.tokenizer = tokenizer
         self.padding = tokenizer.pad_token_id
         marker = "<|im_start|>assistant\n" if "<|im_start|>" in getattr(
@@ -157,33 +170,74 @@ class SFTDataset(Dataset):
             return []
         return res if isinstance(res, list) else []
 
+    def _messages_from_row(self, sample, index: int) -> list:
+        """Parse a unified ``messages`` JSON row and keep the rendering contract.
+
+        The Qwen3 template renders system/turn/tool blocks before the final
+        assistant marker and expects string contents; thinking is disabled so
+        the template prepends an empty ``<think></think>`` block to the
+        supervised answer, which is also what ``eval/eval_sft.py`` uses.
+        """
+        raw = sample['messages']
+        try:
+            messages = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, ValueError):
+            raise ValueError(f"Sample {index} has an invalid messages JSON string") from None
+        if not isinstance(messages, list) or not messages:
+            raise ValueError(f"Sample {index} has an empty messages list")
+
+        normalized = []
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError(f"Sample {index} has a non-dict message entry")
+            content = message.get("content")
+            if not isinstance(content, str):
+                # Tool calls carry arguments outside ``content``; flatten them
+                # so the template still renders an assistant turn.
+                if message.get("tool_calls"):
+                    content = json.dumps(message.get("tool_calls"), ensure_ascii=False)
+                else:
+                    raise ValueError(f"Sample {index} has a message without string content")
+            entry = {"role": message.get("role", "user"), "content": content[:self.max_length]}
+            if message.get("tool_calls"):
+                entry["tool_calls"] = message["tool_calls"]
+            normalized.append(entry)
+        return normalized
+
     def __getitem__(self, index: int):
         sample = self.df.iloc[index]
-        history = self.safe_eval(sample['history'])
-        q = str(sample['q'])
-        a = str(sample['a'])
+        if self.has_messages_column:
+            messages = self._messages_from_row(sample, index)
+        else:
+            history = self.safe_eval(sample['history'])
+            q = str(sample['q'])
+            a = str(sample['a'])
 
-        messages = []
-        for history_message in history:
-            if len(history_message) <= 1:
-                continue
-            messages.append(
-                {"role": 'user', "content": str(history_message[0])[:self.max_length // 2]}
-            )
-            messages.append(
-                {"role": 'assistant', "content": str(history_message[1])[:self.max_length // 2]}
-            )
+            messages = []
+            for history_message in history:
+                if len(history_message) <= 1:
+                    continue
+                messages.append(
+                    {"role": 'user', "content": str(history_message[0])[:self.max_length // 2]}
+                )
+                messages.append(
+                    {"role": 'assistant', "content": str(history_message[1])[:self.max_length // 2]}
+                )
 
-        messages += [
-            {"role": "user", "content": q},
-            {"role": "assistant", "content": a},
-        ]
+            messages += [
+                {"role": "user", "content": q},
+                {"role": "assistant", "content": a},
+            ]
+
         new_prompt = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             # The final assistant message is part of the supervised sample;
             # appending a second generation marker would hide its boundary.
             add_generation_prompt=False,
+            # Qwen3 wraps the answer in <think></think> when thinking is off,
+            # matching the rendering used by eval/eval_sft.py at inference.
+            enable_thinking=False,
         )
         full_input_ids = self.tokenizer(new_prompt).data['input_ids']
         marker_index = self.find_sublist_index(full_input_ids, self.bos_id)

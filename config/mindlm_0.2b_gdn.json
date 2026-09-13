@@ -1,0 +1,29 @@
+{
+  "model_type": "mindlm",
+  "dim": 768,
+  "n_layers": 16,
+  "n_heads": 12,
+  "n_kv_heads": 3,
+  "linear_attn_heads": 3,
+  "vocab_size": 151669,
+  "max_seq_len": 4096,
+  "dropout": 0.0,
+  "norm_eps": 1e-6,
+  "hidden_dim": null,
+  "multiple_of": 256,
+  "use_moe": false,
+  "use_linear_attn": true,
+  "conv_kernel_size": 4,
+  "linear_attn_chunk_size": 64,
+  "linear_attn_impl": "gated_delta_rule",
+  "linear_attn_backend": "fla",
+  "attention_backend": "flash_attn_4",
+  "initialization_scheme": "gdn_v3",
+  "gradient_checkpointing": "all",
+  "layer_types": [
+    "linear_attention", "linear_attention", "linear_attention", "attention",
+    "linear_attention", "linear_attention", "linear_attention", "attention",
+    "linear_attention", "linear_attention", "linear_attention", "attention",
+    "linear_attention", "linear_attention", "linear_attention", "attention"
+  ]
+}

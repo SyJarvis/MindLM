@@ -168,6 +168,7 @@ def parse_args():
     parser.add_argument("--tokenizer_path", default=None)
     parser.add_argument("--model_config", choices=("mindlm_0.1b", "mindlm_0.1b_moe", "mindlm_0.7b"), default="mindlm_0.1b")
     parser.add_argument("--resume_from", required=True, help="Pretraining state dict or MindLM checkpoint")
+    parser.add_argument("--resume_weights_only", action="store_true", help="Load weights but start a fresh training schedule (ignore stored epoch/optimizer state)")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--learning_rate", type=float, default=5e-5)
@@ -179,6 +180,7 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prefetch_factor", type=int, default=4)
     parser.add_argument("--no_persistent_workers", action="store_true")
+    parser.add_argument("--max_seq_len", type=int, default=None, help="Override model config max_seq_len for SFT (default: use model config)")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--ddp", action="store_true", help="Expected when launched through torchrun")
@@ -190,9 +192,7 @@ def parse_args():
     parser.add_argument("--wandb_run_name", default=None)
     parsed = parser.parse_args()
     if parsed.tokenizer_path is None:
-        parsed.tokenizer_path = str(
-            REPOSITORY_ROOT / ("qwen3_tokenizer" if parsed.model_config == "mindlm_0.7b" else "mindlm_tokenizer")
-        )
+        parsed.tokenizer_path = str(REPOSITORY_ROOT / "qwen3_tokenizer")
     if parsed.prefetch_factor < 1:
         raise ValueError("prefetch_factor must be positive")
     if parsed.ddp_bucket_cap_mb < 1:
@@ -224,7 +224,7 @@ if __name__ == "__main__":
     resume_metadata = load_model_checkpoint(model, args.resume_from, args.device)
     if resume_metadata.get("training_stage") not in (None, "pretrain", "sft"):
         raise ValueError("SFT can only initialize from a pretraining or SFT checkpoint.")
-    is_sft_resume = resume_metadata.get("training_stage") == "sft"
+    is_sft_resume = resume_metadata.get("training_stage") == "sft" and not args.resume_weights_only
     if is_sft_resume and resume_metadata.get("optimizer"):
         optimizer.load_state_dict(resume_metadata["optimizer"])
         if resume_metadata.get("scaler"):
@@ -246,11 +246,13 @@ if __name__ == "__main__":
         )
 
     dataframe = pd.read_csv(args.data_path)
-    required_columns = {"history", "q", "a"}
-    missing_columns = required_columns - set(dataframe.columns)
-    if missing_columns:
-        raise ValueError(f"SFT CSV is missing columns: {sorted(missing_columns)}")
-    train_dataset = SFTDataset(dataframe, tokenizer, max_length=config.max_seq_len)
+    if "messages" not in dataframe.columns:
+        required_columns = {"history", "q", "a"}
+        missing_columns = required_columns - set(dataframe.columns)
+        if missing_columns:
+            raise ValueError(f"SFT CSV is missing columns: {sorted(missing_columns)}")
+    sft_max_len = args.max_seq_len if args.max_seq_len is not None else config.max_seq_len
+    train_dataset = SFTDataset(dataframe, tokenizer, max_length=sft_max_len)
     train_sampler = DistributedSampler(train_dataset, seed=1337) if ddp else EpochRandomSampler(train_dataset)
     loader_kwargs = {
         "batch_size": args.batch_size,

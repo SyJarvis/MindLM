@@ -1,10 +1,13 @@
 """Shared configuration, loss, and checkpoint helpers for MindLM scripts."""
 
+import os
+import tempfile
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Sampler
+from torch.utils.checkpoint import checkpoint
 
 try:
     from .config import load_config
@@ -52,22 +55,51 @@ class EpochRandomSampler(Sampler):
         return len(self.data_source)
 
 
-def masked_language_model_loss(logits, targets, loss_mask, aux_loss=None):
-    """Return mean token loss over ``loss_mask`` plus an optional MoE loss."""
-    token_loss = F.cross_entropy(
-        logits.reshape(-1, logits.size(-1)),
-        targets.reshape(-1),
-        reduction="none",
-    )
-    flat_mask = loss_mask.reshape(-1).to(dtype=token_loss.dtype)
-    mask_total = flat_mask.sum()
-    if mask_total.item() == 0:
-        raise ValueError("A batch has no supervised tokens after truncation.")
+def chunked_masked_ce_loss(logits: torch.Tensor, targets: torch.Tensor, loss_mask: torch.Tensor, chunk_tokens: int = 4096):
+    """Return weighted mean CE and fp32 mask count, recomputing CE in backward."""
+    if chunk_tokens < 1:
+        raise ValueError("chunk_tokens must be positive")
+    flat_logits = logits.reshape(-1, logits.size(-1))
+    flat_targets = targets.reshape(-1)
+    flat_mask = loss_mask.reshape(-1).float()
+    denom = flat_mask.sum()
+    if denom.item() == 0:
+        return flat_logits[:0].sum().float(), denom
 
-    loss = (token_loss * flat_mask).sum() / mask_total
+    def chunk_loss(values, labels, weights, selection):
+        per = F.cross_entropy(values[selection].float(), labels[selection], reduction="none")
+        return (per * weights[selection]).sum()
+
+    loss_sum = logits.new_zeros((), dtype=torch.float32)
+    idx = torch.nonzero(flat_mask > 0, as_tuple=False).flatten()
+    for start in range(0, idx.numel(), chunk_tokens):
+        sel = idx[start:start + chunk_tokens]
+        loss_sum = loss_sum + checkpoint(
+            chunk_loss, flat_logits, flat_targets, flat_mask, sel, use_reentrant=False,
+        )
+    return loss_sum / denom, denom
+
+
+def masked_language_model_loss(logits, targets, loss_mask, aux_loss=None, chunk_tokens=4096):
+    """Return mean token loss over ``loss_mask`` plus an optional MoE loss."""
+    token_loss, _ = chunked_masked_ce_loss(logits, targets, loss_mask, chunk_tokens)
+    loss = token_loss
     if aux_loss is not None:
         loss = loss + aux_loss
     return loss
+
+
+def load_model_checkpoint(model, checkpoint_path, map_location, allow_partial_load=False):
+    """Load a model and return checkpoint metadata when it is available."""
+    checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
+    state_dict = extract_model_state(checkpoint)
+    incompatible = model.load_state_dict(state_dict, strict=not allow_partial_load)
+    if allow_partial_load and (incompatible.missing_keys or incompatible.unexpected_keys):
+        print(
+            "Warning: partially loaded checkpoint; "
+            f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+        )
+    return checkpoint if "model" in checkpoint else {}
 
 
 def extract_model_state(checkpoint):
@@ -110,8 +142,8 @@ def load_model_checkpoint(model, checkpoint_path, map_location, allow_partial_lo
     return checkpoint if "model" in checkpoint else {}
 
 
-def save_training_checkpoint(path, model, optimizer, scaler, config, epoch, step, epoch_complete, training_stage):
-    """Save all state required to resume an epoch-boundary training run."""
+def save_training_checkpoint(path, model, optimizer, scaler, config, epoch, step, epoch_complete, training_stage, wandb_run_id=None, extra_state=None):
+    """Atomically save standard training state plus optional trainer-specific state."""
     unwrapped_model = model.module if hasattr(model, "module") else model
     unwrapped_model = unwrapped_model._orig_mod if hasattr(unwrapped_model, "_orig_mod") else unwrapped_model
     checkpoint = {
@@ -123,5 +155,53 @@ def save_training_checkpoint(path, model, optimizer, scaler, config, epoch, step
         "step": step,
         "epoch_complete": epoch_complete,
         "training_stage": training_stage,
+        "wandb_run_id": wandb_run_id,
     }
-    torch.save(checkpoint, Path(path))
+    if extra_state is not None:
+        checkpoint["extra_state"] = extra_state
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            torch.save(checkpoint, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def masked_lm_head_loss(lm_head, hidden_states, targets, loss_mask, chunk_tokens: int = 256, reduction="mean"):
+    """Masked CE computed by applying ``lm_head`` per chunk of hidden states.
+
+    Select supervised hidden states before the head, and checkpoint the head
+    and fp32 CE together so vocabulary-sized intermediates are not retained.
+    """
+    if chunk_tokens < 1:
+        raise ValueError("chunk_tokens must be positive")
+    if reduction not in ("mean", "sum"):
+        raise ValueError("reduction must be 'mean' or 'sum'")
+    flat_h = hidden_states.reshape(-1, hidden_states.size(-1))
+    flat_targets = targets.reshape(-1)
+    flat_mask = loss_mask.reshape(-1).to(dtype=torch.float32)
+    mask_sum = flat_mask.sum()
+    if mask_sum.item() == 0:
+        zero = flat_h[:0].sum().float()
+        for parameter in lm_head.parameters():
+            zero = zero + parameter.reshape(-1)[:0].sum().float()
+        return zero
+
+    def chunk_loss(hidden, labels, weights, selection):
+        per = F.cross_entropy(lm_head(hidden[selection]).float(), labels[selection], reduction="none")
+        return (per * weights[selection]).sum()
+
+    idx = torch.nonzero(flat_mask > 0, as_tuple=False).flatten()
+    loss_sum = flat_h.new_zeros((), dtype=torch.float32)
+    for start in range(0, idx.numel(), chunk_tokens):
+        sel = idx[start:start + chunk_tokens]
+        loss_sum = loss_sum + checkpoint(
+            chunk_loss, flat_h, flat_targets, flat_mask, sel, use_reentrant=False,
+        )
+    return loss_sum if reduction == "sum" else loss_sum / mask_sum

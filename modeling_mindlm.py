@@ -1,6 +1,5 @@
 """
-MindLM: MiniMind with Linear Attention + MoE
-基于MiniMind架构，集成Gated DeltaNet Linear Attention
+MindLM
 """
 
 import math
@@ -22,12 +21,18 @@ try:
 except ImportError:  # pragma: no cover - fla is an optional acceleration dep
     _fla_chunk_gdr = None
 
+try:
+    from flash_attn.cute import flash_attn_func as _flash_attn_4
+except ImportError:  # pragma: no cover - FA4 is an optional CUDA dependency
+    _flash_attn_4 = None
+
 
 @dataclass
 class MindLMCausalLMOutputWithPast(CausalLMOutputWithPast):
     """Causal LM output extended with the MoE load-balancing loss."""
 
     aux_loss: Optional[torch.FloatTensor] = None
+    last_hidden_state: Optional[torch.FloatTensor] = None
 
 
 class RMSNorm(nn.Module):
@@ -107,11 +112,22 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
+        self.attention_backend = args.attention_backend
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
 
         mask = torch.ones((1, 1, args.max_seq_len, args.max_seq_len), dtype=torch.bool)
         mask = torch.triu(mask, diagonal=1)
         self.register_buffer("mask", mask, persistent=False)
+
+    def _flash_attention(self, query, key, value):
+        if _flash_attn_4 is None:
+            raise RuntimeError("attention_backend='flash_attn_4' requires flash_attn.cute on CUDA")
+        if self.training and self.dropout != 0:
+            raise ValueError("flash_attn_4 does not support nonzero attention dropout during training")
+        if query.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("flash_attn_4 requires float16 or bfloat16 inputs")
+        output, _lse = _flash_attn_4(query, key, value, causal=True)
+        return output
 
     def forward(self, x: torch.Tensor, pos_cis: torch.Tensor, kv_cache=False):
         bsz, seqlen, _ = x.shape
@@ -124,6 +140,11 @@ class Attention(nn.Module):
 
         if pos_cis is not None:
             xq, xk = apply_rotary_emb(xq, xk, pos_cis)
+
+        # CPU evaluation uses SDPA; FA4 receives native BTHD GQA on CUDA.
+        if self.attention_backend == 'flash_attn_4' and xq.is_cuda:
+            output = self._flash_attention(xq, xk, xv)
+            return self.resid_dropout(self.wo(output.reshape(bsz, seqlen, -1)))
 
         xk = repeat_kv(xk, self.n_rep)
         xv = repeat_kv(xv, self.n_rep)
@@ -174,6 +195,7 @@ class GatedDeltaNet(nn.Module):
         self.conv_kernel_size = getattr(args, 'conv_kernel_size', 4)
         self.chunk_size = getattr(args, 'linear_attn_chunk_size', 64)
         self.linear_attn_impl = getattr(args, 'linear_attn_impl', 'simple')
+        self.linear_attn_backend = args.linear_attn_backend
         if self.linear_attn_impl not in {'simple', 'gated_delta_rule'}:
             raise ValueError(
                 "linear_attn_impl must be 'simple' or 'gated_delta_rule'"
@@ -203,11 +225,23 @@ class GatedDeltaNet(nn.Module):
 
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
         self.A_log = nn.Parameter(torch.log(torch.arange(1, self.num_v_heads + 1).float()))
+        if args.initialization_scheme == 'gdn_v3':
+            self.dt_bias._no_weight_decay = True
+            self.A_log._no_weight_decay = True
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
+
+    def _select_backend(self, device):
+        if device.type != 'cuda' or self.linear_attn_backend == 'reference':
+            return 'reference'
+        if self.linear_attn_backend == 'fla':
+            if _fla_chunk_gdr is None:
+                raise RuntimeError("linear_attn_backend='fla' requires flash-linear-attention on CUDA")
+            return 'fla'
+        return 'fla' if _fla_chunk_gdr is not None and not getattr(self, 'use_reference_gdr', False) else 'reference'
 
     def forward(self, x: torch.Tensor, pos_cis=None, kv_cache=False):
         batch_size, seq_len, _ = x.shape
@@ -239,17 +273,7 @@ class GatedDeltaNet(nn.Module):
             key = key.repeat_interleave(n_rep, dim=2)
 
         if self.linear_attn_impl == 'gated_delta_rule':
-            # Prefer the fused FLA chunk kernel when available; it is
-            # numerically aligned with the reference but far faster. Fall back
-            # to the per-token reference when fla is missing, on CPU (the FLA
-            # Triton kernel is CUDA-only), or when a caller explicitly requested
-            # the reference path (e.g. debugging).
-            use_fla = (
-                _fla_chunk_gdr is not None
-                and not getattr(self, 'use_reference_gdr', False)
-                and query.is_cuda
-            )
-            if use_fla:
+            if self._select_backend(query.device) == 'fla':
                 core_attn_out = self.gated_delta_rule_fla(query, key, value, g, beta)
             else:
                 core_attn_out = self.gated_delta_rule_attention(query, key, value, g, beta)
@@ -304,8 +328,8 @@ class GatedDeltaNet(nn.Module):
         g = g.transpose(1, 2).contiguous()
 
         output_dtype = query.dtype
-        query = l2norm(query, dim=-1).float()
-        key = l2norm(key, dim=-1).float()
+        query = l2norm(query.float(), dim=-1).to(output_dtype).float()
+        key = l2norm(key.float(), dim=-1).to(output_dtype).float()
         value = value.float()
         beta = beta.float()
         g = g.float()
@@ -668,6 +692,9 @@ class MindLMConfig(PretrainedConfig):
         conv_kernel_size: int = 4,        # 因果卷积核大小，提供局部位置感知，替代位置编码
         linear_attn_chunk_size: int = 64, # 线性注意力块大小；须在训练前固定
         linear_attn_impl: str = 'simple',  # 'simple' 兼容旧权重；'gated_delta_rule' 为完整规则
+        linear_attn_backend: str = 'auto',  # CPU uses reference; CUDA can require FLA explicitly
+        attention_backend: str = 'sdpa',
+        initialization_scheme: str = 'legacy',
         # ========== 训练优化 ==========
         gradient_checkpointing: str = 'off',  # 梯度检查点策略：'off'=关闭，'linear_attn'=仅linear层，'all'=所有层
         **kwargs
@@ -710,6 +737,9 @@ class MindLMConfig(PretrainedConfig):
         self.conv_kernel_size = conv_kernel_size    # 因果卷积核大小
         self.linear_attn_chunk_size = linear_attn_chunk_size
         self.linear_attn_impl = linear_attn_impl
+        self.linear_attn_backend = linear_attn_backend
+        self.attention_backend = attention_backend
+        self.initialization_scheme = initialization_scheme
         self.gradient_checkpointing = gradient_checkpointing  # 梯度检查点策略
         self.use_cache = False
 
@@ -719,6 +749,14 @@ class MindLMConfig(PretrainedConfig):
             raise ValueError("linear_attn_chunk_size must be positive")
         if linear_attn_impl not in {'simple', 'gated_delta_rule'}:
             raise ValueError("linear_attn_impl must be 'simple' or 'gated_delta_rule'")
+        if linear_attn_backend not in {'auto', 'reference', 'fla'}:
+            raise ValueError("linear_attn_backend must be 'auto', 'reference', or 'fla'")
+        if attention_backend not in {'sdpa', 'flash_attn_4'}:
+            raise ValueError("attention_backend must be 'sdpa' or 'flash_attn_4'")
+        if initialization_scheme not in {'legacy', 'gdn_v3'}:
+            raise ValueError("initialization_scheme must be 'legacy' or 'gdn_v3'")
+        if linear_attn_backend == 'fla' and linear_attn_impl != 'gated_delta_rule':
+            raise ValueError("linear_attn_backend='fla' requires linear_attn_impl='gated_delta_rule'")
         if n_kv_heads is not None and n_heads % n_kv_heads != 0:
             raise ValueError("n_heads must be divisible by n_kv_heads")
         if linear_attn_heads is not None and n_heads % linear_attn_heads != 0:
@@ -822,16 +860,39 @@ class MindLM(PreTrainedModel, GenerationMixin):
         else:
             self.pos_cis = None
 
-        self.apply(self._init_weights)
-
-        for pn, p in self.named_parameters():
-            if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
-                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
+        if config.initialization_scheme == 'legacy':
+            self.apply(self._init_weights)
+            for pn, p in self.named_parameters():
+                if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
+                    nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
+        else:
+            for layer in self.layers:
+                projection = layer.attention.out_proj if layer.layer_type == 'linear_attention' else layer.attention.wo
+                projection._mindlm_residual_projection = True
+                for name, module in layer.feed_forward.named_modules():
+                    if name == 'w2' or name.endswith('.w2'):
+                        module._mindlm_residual_projection = True
 
         self.aux_loss = 0.0
         self.post_init()
 
     def _init_weights(self, module):
+        if self.config.initialization_scheme == 'gdn_v3':
+            if isinstance(module, (nn.Linear, nn.Embedding)):
+                # The embedding and output head share one parameter.
+                if not getattr(module.weight, '_mindlm_v3_initialized', False):
+                    std = 0.02 / math.sqrt(2 * self.config.n_layers) if getattr(module, '_mindlm_residual_projection', False) else 0.02
+                    nn.init.normal_(module.weight, mean=0.0, std=std)
+                    module.weight._mindlm_v3_initialized = True
+                if getattr(module, 'bias', None) is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, GatedDeltaNet):
+                with torch.no_grad():
+                    amplitude = torch.empty_like(module.A_log).uniform_(0, 16).clamp_min_(torch.finfo(module.A_log.dtype).tiny)
+                    module.A_log.copy_(amplitude.log())
+                    dt = torch.exp(torch.empty_like(module.dt_bias).uniform_(math.log(0.001), math.log(0.1)))
+                    module.dt_bias.copy_(dt + torch.log(-torch.expm1(-dt)))
+            return
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -854,6 +915,7 @@ class MindLM(PreTrainedModel, GenerationMixin):
         labels=None,
         tokens=None,
         targets=None,
+        return_logits=True,
         **kwargs,
     ):
         """Run a full causal-LM forward pass without a KV cache.
@@ -868,6 +930,8 @@ class MindLM(PreTrainedModel, GenerationMixin):
             labels = targets
         if input_ids is None:
             raise ValueError("input_ids is required")
+        if labels is not None and not return_logits:
+            raise ValueError("labels require return_logits=True")
 
         _bsz, seqlen = input_ids.shape
         if seqlen > self.config.max_seq_len:
@@ -890,7 +954,7 @@ class MindLM(PreTrainedModel, GenerationMixin):
 
         h = self.norm(h)
 
-        logits = self.output(h)
+        logits = self.output(h) if return_logits else None
         loss = None
         if labels is not None:
             loss = F.cross_entropy(
@@ -908,6 +972,7 @@ class MindLM(PreTrainedModel, GenerationMixin):
             hidden_states=None,
             attentions=None,
             aux_loss=total_aux_loss if isinstance(total_aux_loss, torch.Tensor) else None,
+            last_hidden_state=h if not return_logits else None,
         )
 
     @torch.inference_mode()

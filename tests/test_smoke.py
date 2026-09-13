@@ -109,7 +109,7 @@ class MindLMSmokeTest(unittest.TestCase):
                     token_ids = [3, 4, 5, 1, 9, 6, 7, 8, 2]
                 return SimpleNamespace(data={"input_ids": token_ids})
 
-            def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+            def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=None):
                 return "formatted"
 
         dataframe = pd.DataFrame([{"history": "[]", "q": "question", "a": "answer"}])
