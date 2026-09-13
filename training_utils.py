@@ -1,5 +1,6 @@
 """Shared configuration, loss, and checkpoint helpers for MindLM scripts."""
 
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -8,6 +9,18 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Sampler
 from torch.utils.checkpoint import checkpoint
+
+
+def cosine_learning_rate(step, total_steps, warmup_steps, base_lr, min_lr_ratio=0.1):
+    """Warmup followed by cosine decay, shared by all training entry points."""
+    if warmup_steps < 0 or total_steps < 1 or base_lr <= 0:
+        raise ValueError("total_steps must be positive, warmup_steps non-negative, and base_lr positive")
+    if warmup_steps > 0 and step < warmup_steps:
+        return base_lr * step / warmup_steps
+    decay_steps = max(total_steps - warmup_steps, 1)
+    progress = min(max((step - warmup_steps) / decay_steps, 0.0), 1.0)
+    min_lr = base_lr * min_lr_ratio
+    return min_lr + 0.5 * (1.0 + math.cos(math.pi * progress)) * (base_lr - min_lr)
 
 try:
     from .config import load_config

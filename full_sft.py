@@ -19,6 +19,7 @@ from dataset import SFTDataset
 from modeling_mindlm import MindLM
 from training_utils import (
     build_model_config,
+    cosine_learning_rate,
     EpochRandomSampler,
     load_model_checkpoint,
     masked_language_model_loss,
@@ -39,13 +40,7 @@ def log(message):
 
 
 def get_lr(step, total_steps):
-    if args.warmup_iters > 0 and step < args.warmup_iters:
-        return args.learning_rate * step / args.warmup_iters
-
-    decay_steps = max(total_steps - args.warmup_iters, 1)
-    progress = min(max((step - args.warmup_iters) / decay_steps, 0.0), 1.0)
-    min_lr = args.learning_rate / 10
-    return min_lr + 0.5 * (1.0 + math.cos(math.pi * progress)) * (args.learning_rate - min_lr)
+    return cosine_learning_rate(step, total_steps, args.warmup_iters, args.learning_rate)
 
 
 def optimizer_step(gradient_scale=1.0):

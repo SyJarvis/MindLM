@@ -29,7 +29,7 @@ from torch import optim
 from torch.utils.data import DataLoader, Dataset
 
 from modeling_mindlm import MindLM
-from training_utils import build_model_config, load_model_checkpoint, masked_lm_head_loss, save_training_checkpoint
+from training_utils import build_model_config, cosine_learning_rate, load_model_checkpoint, masked_lm_head_loss, save_training_checkpoint
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent
 
@@ -43,12 +43,7 @@ def log(message):
 
 
 def get_lr(step, total_steps, warmup, base_lr):
-    if warmup > 0 and step < warmup:
-        return base_lr * step / warmup
-    decay_steps = max(total_steps - warmup, 1)
-    progress = min(max((step - warmup) / decay_steps, 0.0), 1.0)
-    min_lr = base_lr / 10
-    return min_lr + 0.5 * (1.0 + math.cos(math.pi * progress)) * (base_lr - min_lr)
+    return cosine_learning_rate(step, total_steps, warmup, base_lr)
 
 
 class GroupedSFTDataset(Dataset):
