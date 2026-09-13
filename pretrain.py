@@ -33,6 +33,8 @@ from training_utils import (
     masked_language_model_loss,
     save_training_checkpoint,
 )
+from trainers.pretrain_legacy import run_legacy as _run_legacy_trainer
+from trainers.pretrain_v3 import run_v3 as _run_v3_trainer
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent
@@ -428,8 +430,9 @@ def v3_runtime_fingerprint(device):
              "cuda": torch.version.cuda, "packages": packages,
              "device_type": device.type, "matmul_precision": torch.get_float32_matmul_precision(),
              "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
-             "source_sha256": {name: file_sha256(REPOSITORY_ROOT / name)
-                               for name in ("pretrain.py", "training_utils.py", "modeling_mindlm.py", "config.py", "dataset.py")},
+            "source_sha256": {name: file_sha256(REPOSITORY_ROOT / name)
+                               for name in ("pretrain.py", "trainers/pretrain_legacy.py", "trainers/pretrain_v3.py",
+                                            "training_utils.py", "modeling_mindlm.py", "config.py", "dataset.py")},
              "kernel_environment": {key: os.environ.get(key) for key in (
                  "FLA_DISABLE_BACKEND_DISPATCH", "FLA_TILELANG", "FLA_FLASH_QLA", "FLA_USE_TMA",
                  "TRITON_F32_DEFAULT", "NVIDIA_TF32_OVERRIDE", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE",
@@ -723,9 +726,9 @@ def run_v3(parsed):
 def main():
     parsed = parse_args()
     if parsed.model_config == "mindlm_0.2b_gdn":
-        run_v3(parsed)
+        _run_v3_trainer(parsed)
     else:
-        run_legacy(parsed)
+        _run_legacy_trainer(parsed)
 
 
 if __name__ == "__main__":
