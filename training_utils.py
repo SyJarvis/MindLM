@@ -129,19 +129,6 @@ def extract_model_state(checkpoint):
     return normalized
 
 
-def load_model_checkpoint(model, checkpoint_path, map_location, allow_partial_load=False):
-    """Load a model and return checkpoint metadata when it is available."""
-    checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
-    state_dict = extract_model_state(checkpoint)
-    incompatible = model.load_state_dict(state_dict, strict=not allow_partial_load)
-    if allow_partial_load and (incompatible.missing_keys or incompatible.unexpected_keys):
-        print(
-            "Warning: partially loaded checkpoint; "
-            f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
-        )
-    return checkpoint if "model" in checkpoint else {}
-
-
 def save_training_checkpoint(path, model, optimizer, scaler, config, epoch, step, epoch_complete, training_stage, wandb_run_id=None, extra_state=None):
     """Atomically save standard training state plus optional trainer-specific state."""
     unwrapped_model = model.module if hasattr(model, "module") else model
