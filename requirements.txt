@@ -1,6 +1,6 @@
 # Core ML
 torch==2.8.0
-transformers==4.64.3
+transformers
 accelerate==1.13.0
 safetensors==0.7.0
 tokenizers==0.22.1

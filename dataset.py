@@ -45,7 +45,7 @@ class PretrainDataset(Dataset):
 
 
 class PackedPretrainDataset(Dataset):
-    """Memory-map fixed-length, EOS-delimited pretraining token blocks.
+    """Memory-map fixed-length, Qwen3 chat-EOS-delimited token blocks.
 
     ``prepare_pretrain_data.py`` writes ``<prefix>.bin`` and ``<prefix>.json``.
     Every stored record has ``max_length + 1`` real tokens, so this dataset avoids
@@ -54,6 +54,7 @@ class PackedPretrainDataset(Dataset):
     """
 
     FORMAT = "mindlm_packed_pretrain_v1"
+    BOUNDARY_TOKEN = "<|im_end|>"
 
     def __init__(self, prefix, max_length, tokenizer_vocab_size=None):
         super().__init__()
@@ -74,6 +75,20 @@ class PackedPretrainDataset(Dataset):
                 f"Packed sequence length is {metadata.get('sequence_length')}, "
                 f"but the model requires {max_length}."
             )
+        if metadata.get("boundary_token") != self.BOUNDARY_TOKEN:
+            raise ValueError(
+                "Packed dataset must use the Qwen3 chat EOS boundary "
+                f"{self.BOUNDARY_TOKEN!r}"
+            )
+        boundary_token_id = metadata.get("boundary_token_id")
+        if (
+            not isinstance(boundary_token_id, int)
+            or isinstance(boundary_token_id, bool)
+            or boundary_token_id < 0
+        ):
+            raise ValueError("Packed dataset boundary_token_id must be a non-negative integer")
+        if metadata.get("loss_mask_dtype") != "uint8":
+            raise ValueError("Packed dataset loss_mask_dtype must be uint8")
         if tokenizer_vocab_size is not None and metadata.get("tokenizer_vocab_size") != tokenizer_vocab_size:
             raise ValueError(
                 "Packed dataset tokenizer vocabulary does not match the selected tokenizer: "
@@ -84,6 +99,8 @@ class PackedPretrainDataset(Dataset):
         self.tokens_per_record = metadata.get("tokens_per_record")
         self.num_sequences = metadata.get("num_sequences")
         dtype = np.dtype(metadata.get("dtype", "uint32"))
+        if dtype != np.dtype("uint32"):
+            raise ValueError("Packed dataset token dtype must be uint32")
         if self.tokens_per_record != max_length + 1:
             raise ValueError("Packed dataset record width must be max_length + 1")
         if not isinstance(self.num_sequences, int) or self.num_sequences < 1:
@@ -102,7 +119,10 @@ class PackedPretrainDataset(Dataset):
             dtype=dtype,
             shape=(self.num_sequences, self.tokens_per_record),
         )
-        self.loss_mask = torch.ones(max_length, dtype=torch.int64)
+        # Packed pretraining has no padding. Keep the in-memory mask compact
+        # and match the v1 on-disk ``uint8`` contract; the loss helper promotes
+        # it to fp32 when computing the weighted token mean.
+        self.loss_mask = torch.ones(max_length, dtype=torch.uint8)
 
     def __len__(self):
         return self.num_sequences
@@ -117,6 +137,18 @@ class PackedPretrainDataset(Dataset):
 
 
 class SFTDataset(Dataset):
+    """Chat SFT with assistant-only loss.
+
+    Two CSV schemas are supported:
+      - legacy: ``history, q, a`` columns (q/a become the final exchange)
+      - unified: ``messages`` column holding an OpenAI-style JSON list,
+        rendered verbatim with the tokenizer's chat template
+
+    The chat template must end every assistant turn with the same marker
+    (``<|im_start|>assistant\\n`` for the Qwen3 tokenizer); loss is applied
+    from the final marker up to (and including) the closing ``<|im_end|>``.
+    """
+
     def __init__(self, df, tokenizer, max_length=1024, prompt_max_len=512, answer_max_len=256):
         super().__init__()
         if max_length < 2:
@@ -127,6 +159,7 @@ class SFTDataset(Dataset):
         self.max_length = max_length
         self.prompt_max_len = prompt_max_len
         self.answer_max_len = answer_max_len
+        self.has_messages_column = "messages" in getattr(df, "columns", [])
         self.tokenizer = tokenizer
         self.padding = tokenizer.pad_token_id
         marker = "<|im_start|>assistant\n" if "<|im_start|>" in getattr(
@@ -157,33 +190,74 @@ class SFTDataset(Dataset):
             return []
         return res if isinstance(res, list) else []
 
+    def _messages_from_row(self, sample, index: int) -> list:
+        """Parse a unified ``messages`` JSON row and keep the rendering contract.
+
+        The Qwen3 template renders system/turn/tool blocks before the final
+        assistant marker and expects string contents; thinking is disabled so
+        the template prepends an empty ``<think></think>`` block to the
+        supervised answer, which is also what ``eval/eval_sft.py`` uses.
+        """
+        raw = sample['messages']
+        try:
+            messages = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, ValueError):
+            raise ValueError(f"Sample {index} has an invalid messages JSON string") from None
+        if not isinstance(messages, list) or not messages:
+            raise ValueError(f"Sample {index} has an empty messages list")
+
+        normalized = []
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError(f"Sample {index} has a non-dict message entry")
+            content = message.get("content")
+            if not isinstance(content, str):
+                # Tool calls carry arguments outside ``content``; flatten them
+                # so the template still renders an assistant turn.
+                if message.get("tool_calls"):
+                    content = json.dumps(message.get("tool_calls"), ensure_ascii=False)
+                else:
+                    raise ValueError(f"Sample {index} has a message without string content")
+            entry = {"role": message.get("role", "user"), "content": content[:self.max_length]}
+            if message.get("tool_calls"):
+                entry["tool_calls"] = message["tool_calls"]
+            normalized.append(entry)
+        return normalized
+
     def __getitem__(self, index: int):
         sample = self.df.iloc[index]
-        history = self.safe_eval(sample['history'])
-        q = str(sample['q'])
-        a = str(sample['a'])
+        if self.has_messages_column:
+            messages = self._messages_from_row(sample, index)
+        else:
+            history = self.safe_eval(sample['history'])
+            q = str(sample['q'])
+            a = str(sample['a'])
 
-        messages = []
-        for history_message in history:
-            if len(history_message) <= 1:
-                continue
-            messages.append(
-                {"role": 'user', "content": str(history_message[0])[:self.max_length // 2]}
-            )
-            messages.append(
-                {"role": 'assistant', "content": str(history_message[1])[:self.max_length // 2]}
-            )
+            messages = []
+            for history_message in history:
+                if len(history_message) <= 1:
+                    continue
+                messages.append(
+                    {"role": 'user', "content": str(history_message[0])[:self.max_length // 2]}
+                )
+                messages.append(
+                    {"role": 'assistant', "content": str(history_message[1])[:self.max_length // 2]}
+                )
 
-        messages += [
-            {"role": "user", "content": q},
-            {"role": "assistant", "content": a},
-        ]
+            messages += [
+                {"role": "user", "content": q},
+                {"role": "assistant", "content": a},
+            ]
+
         new_prompt = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             # The final assistant message is part of the supervised sample;
             # appending a second generation marker would hide its boundary.
             add_generation_prompt=False,
+            # Qwen3 wraps the answer in <think></think> when thinking is off,
+            # matching the rendering used by eval/eval_sft.py at inference.
+            enable_thinking=False,
         )
         full_input_ids = self.tokenizer(new_prompt).data['input_ids']
         marker_index = self.find_sublist_index(full_input_ids, self.bos_id)

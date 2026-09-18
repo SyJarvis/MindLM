@@ -4,4 +4,8 @@
 /out
 __pycache__/
 .DS_Store
-out/
+
+out_pretrain_minimind_pb/
+logs/
+data/
+scripts/__pycache__/

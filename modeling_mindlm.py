@@ -1,6 +1,5 @@
 """
-MindLM: MiniMind with Linear Attention + MoE
-基于MiniMind架构，集成Gated DeltaNet Linear Attention
+MindLM
 """
 
 import math
@@ -9,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as cp
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 from transformers import PreTrainedModel, PretrainedConfig, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -17,18 +16,50 @@ try:
     # Optional fused training kernel. When available, ``gated_delta_rule``
     # inference and training dispatch to this chunk kernel instead of the
     # per-token PyTorch reference. The reference path remains the fallback for
-    # stateful recurrence and for environments without fla installed.
+    # single-token recurrence and for environments without fla installed.
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _fla_chunk_gdr
 except ImportError:  # pragma: no cover - fla is an optional acceleration dep
     _fla_chunk_gdr = None
 
+try:
+    from flash_attn.cute import flash_attn_func as _flash_attn_4
+except ImportError:  # pragma: no cover - FA4 is an optional CUDA dependency
+    _flash_attn_4 = None
+
+@dataclass(frozen=True)
+class AttentionCache:
+    """Rotated keys and values in [batch, time, KV heads, head dim]."""
+
+    key: torch.Tensor
+    value: torch.Tensor
+
+@dataclass(frozen=True)
+class GatedDeltaNetCache:
+    """Raw convolution history [B, C, K-1] and FP32 state [B, H, Dk, Dv]."""
+
+    conv_state: torch.Tensor
+    recurrent_state: torch.Tensor
+
+@dataclass(frozen=True)
+class MindLMCache:
+    """Request-local inference cache; pass only new tokens when reusing it."""
+
+    seq_length: int
+    layers: Tuple[Union[AttentionCache, GatedDeltaNetCache], ...]
+
+def _validate_cache_tensor(tensor, shape, device, name, dtype=None):
+    if not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != tuple(shape):
+        raise ValueError(f"{name} must be a tensor with shape {tuple(shape)}")
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on device {device}")
+    if dtype is not None and tensor.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}")
 
 @dataclass
 class MindLMCausalLMOutputWithPast(CausalLMOutputWithPast):
-    """Causal LM output extended with the MoE load-balancing loss."""
+    """Causal LM output extended with the pre-head hidden state."""
 
-    aux_loss: Optional[torch.FloatTensor] = None
-
+    last_hidden_state: Optional[torch.FloatTensor] = None
 
 class RMSNorm(nn.Module):
     """RMSNorm实现"""
@@ -44,7 +75,6 @@ class RMSNorm(nn.Module):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
-
 def precompute_pos_cis(dim: int, end: int, theta: float = 10000.0):
     """预计算旋转位置编码"""
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -52,7 +82,6 @@ def precompute_pos_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = torch.outer(t, freqs).float()
     pos_cis = torch.polar(torch.ones_like(freqs), freqs)
     return pos_cis
-
 
 def apply_rotary_emb(xq, xk, pos_cis):
     """应用旋转位置编码"""
@@ -70,7 +99,6 @@ def apply_rotary_emb(xq, xk, pos_cis):
     xk_out = torch.view_as_real(xk_ * pos_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
-
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """重复KV头"""
     bs, slen, n_kv_heads, head_dim = x.shape
@@ -82,12 +110,10 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
-
 def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6):
     """L2归一化"""
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
     return x * inv_norm
-
 
 class Attention(nn.Module):
     """标准多头注意力"""
@@ -107,57 +133,75 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
+        self.attention_backend = args.attention_backend
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
 
         mask = torch.ones((1, 1, args.max_seq_len, args.max_seq_len), dtype=torch.bool)
         mask = torch.triu(mask, diagonal=1)
         self.register_buffer("mask", mask, persistent=False)
 
-    def forward(self, x: torch.Tensor, pos_cis: torch.Tensor, kv_cache=False):
+    def _flash_attention(self, query, key, value):
+        if _flash_attn_4 is None:
+            raise RuntimeError("attention_backend='flash_attn_4' requires flash_attn.cute on CUDA")
+        if self.training and self.dropout != 0:
+            raise ValueError("flash_attn_4 does not support nonzero attention dropout during training")
+        if query.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("flash_attn_4 requires float16 or bfloat16 inputs")
+        output, _lse = _flash_attn_4(query, key, value, causal=True)
+        return output
+
+    def forward(self, x: torch.Tensor, pos_cis: torch.Tensor, past_key_value=None, use_cache=False):
         bsz, seqlen, _ = x.shape
-
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-
-        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
-
+        xq = self.wq(x).view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = self.wk(x).view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = self.wv(x).view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         if pos_cis is not None:
             xq, xk = apply_rotary_emb(xq, xk, pos_cis)
 
-        xk = repeat_kv(xk, self.n_rep)
-        xv = repeat_kv(xv, self.n_rep)
+        past_length = 0
+        if past_key_value is not None:
+            past_length = past_key_value.key.size(1)
+            _validate_cache_tensor(past_key_value.key,
+                                   (bsz, past_length, self.n_local_kv_heads, self.head_dim),
+                                   xk.device, "attention key cache", xk.dtype)
+            _validate_cache_tensor(past_key_value.value, past_key_value.key.shape,
+                                   xv.device, "attention value cache", xv.dtype)
+            xk = torch.cat((past_key_value.key, xk), dim=1)
+            xv = torch.cat((past_key_value.value, xv), dim=1)
+        # Store native GQA heads, before repeating them for the SDPA fallback.
+        present = AttentionCache(xk.detach(), xv.detach()) if use_cache else None
 
+        # Keep FA4 for square prefill/training. Cached rectangular attention uses
+        # an explicit offset mask, independent of backend causal alignment.
+        if self.attention_backend == 'flash_attn_4' and xq.is_cuda and not past_length:
+            output = self._flash_attention(xq, xk, xv)
+            output = self.resid_dropout(self.wo(output.reshape(bsz, seqlen, -1)))
+            return (output, present) if use_cache else output
+
+        xk = repeat_kv(xk, self.n_rep).transpose(1, 2)
+        xv = repeat_kv(xv, self.n_rep).transpose(1, 2)
         xq = xq.transpose(1, 2)
-        xk = xk.transpose(1, 2)
-        xv = xv.transpose(1, 2)
-
-        if self.flash and seqlen != 1:
-            output = torch.nn.functional.scaled_dot_product_attention(
-                xq, xk, xv, attn_mask=None,
+        total_length = past_length + seqlen
+        blocked = self.mask[:, :, past_length:total_length, :total_length]
+        if self.flash:
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv,
+                attn_mask=~blocked if past_length else None,
                 dropout_p=self.dropout if self.training else 0.0,
-                is_causal=True
+                is_causal=not bool(past_length),
             )
         else:
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
-            scores = scores.masked_fill(self.mask[:, :, :seqlen, :seqlen], float("-inf"))
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            scores = self.attn_dropout(scores)
+            scores = scores.masked_fill(blocked, float("-inf"))
+            scores = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq))
             output = torch.matmul(scores, xv)
 
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        output = self.wo(output)
-        output = self.resid_dropout(output)
-        return output
-
+        output = self.resid_dropout(self.wo(output))
+        return (output, present) if use_cache else output
 
 class GatedDeltaNet(nn.Module):
-    """
-    Gated DeltaNet linear attention with selectable legacy and full rules.
-
-    ``simple`` preserves the original MindLM recurrence for old checkpoints;
-    ``gated_delta_rule`` applies the prediction-residual update used by FLA.
-    """
+    """Gated DeltaNet with the complete prediction-residual update rule."""
     def __init__(self, args):
         super().__init__()
         self.hidden_size = args.dim
@@ -173,11 +217,7 @@ class GatedDeltaNet(nn.Module):
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.conv_kernel_size = getattr(args, 'conv_kernel_size', 4)
         self.chunk_size = getattr(args, 'linear_attn_chunk_size', 64)
-        self.linear_attn_impl = getattr(args, 'linear_attn_impl', 'simple')
-        if self.linear_attn_impl not in {'simple', 'gated_delta_rule'}:
-            raise ValueError(
-                "linear_attn_impl must be 'simple' or 'gated_delta_rule'"
-            )
+        self.linear_attn_backend = args.linear_attn_backend
         if self.chunk_size < 1:
             raise ValueError("linear_attn_chunk_size must be positive")
 
@@ -190,12 +230,6 @@ class GatedDeltaNet(nn.Module):
             padding=self.conv_kernel_size - 1,
             bias=False,
         )
-        self.register_buffer(
-            "chunk_causal_mask",
-            torch.tril(torch.ones(self.chunk_size, self.chunk_size, dtype=torch.bool)),
-            persistent=False,
-        )
-
         self.in_proj_qkv = nn.Linear(self.hidden_size, self.conv_dim, bias=False)
         self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
@@ -203,13 +237,22 @@ class GatedDeltaNet(nn.Module):
 
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
         self.A_log = nn.Parameter(torch.log(torch.arange(1, self.num_v_heads + 1).float()))
+        self.dt_bias._no_weight_decay = True
+        self.A_log._no_weight_decay = True
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
 
-    def forward(self, x: torch.Tensor, pos_cis=None, kv_cache=False):
+    def _select_backend(self, device):
+        if device.type != 'cuda':
+            return 'reference'
+        if _fla_chunk_gdr is None:
+            raise RuntimeError("linear_attn_backend='fla' requires flash-linear-attention on CUDA")
+        return 'fla'
+
+    def forward(self, x: torch.Tensor, pos_cis=None, past_key_value=None, use_cache=False):
         batch_size, seq_len, _ = x.shape
 
         mixed_qkv = self.in_proj_qkv(x).transpose(1, 2)
@@ -217,8 +260,27 @@ class GatedDeltaNet(nn.Module):
         b = self.in_proj_b(x)
         a = self.in_proj_a(x)
 
-        mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
-        mixed_qkv = mixed_qkv.transpose(1, 2)
+        conv_state = None
+        initial_state = None
+        if past_key_value is not None:
+            _validate_cache_tensor(past_key_value.conv_state,
+                                   (batch_size, self.conv_dim, self.conv_kernel_size - 1),
+                                   mixed_qkv.device, "GDN convolution cache", mixed_qkv.dtype)
+            _validate_cache_tensor(past_key_value.recurrent_state,
+                                   (batch_size, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+                                   mixed_qkv.device, "GDN recurrent cache", torch.float32)
+            conv_input = torch.cat((past_key_value.conv_state, mixed_qkv), dim=-1)
+            initial_state = past_key_value.recurrent_state
+            mixed_qkv = F.conv1d(conv_input, self.conv1d.weight,
+                                 bias=self.conv1d.bias, groups=self.conv_dim)
+        else:
+            conv_input = F.pad(mixed_qkv, (self.conv_kernel_size - 1, 0)) if use_cache else None
+            mixed_qkv = self.conv1d(mixed_qkv)[:, :, :seq_len]
+        if use_cache:
+            # clone prevents the small history view retaining the full prefill.
+            history_start = conv_input.size(-1) - (self.conv_kernel_size - 1)
+            conv_state = conv_input[:, :, history_start:].clone().detach()
+        mixed_qkv = F.silu(mixed_qkv).transpose(1, 2)
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -238,23 +300,19 @@ class GatedDeltaNet(nn.Module):
             query = query.repeat_interleave(n_rep, dim=2)
             key = key.repeat_interleave(n_rep, dim=2)
 
-        if self.linear_attn_impl == 'gated_delta_rule':
-            # Prefer the fused FLA chunk kernel when available; it is
-            # numerically aligned with the reference but far faster. Fall back
-            # to the per-token reference when fla is missing, on CPU (the FLA
-            # Triton kernel is CUDA-only), or when a caller explicitly requested
-            # the reference path (e.g. debugging).
-            use_fla = (
-                _fla_chunk_gdr is not None
-                and not getattr(self, 'use_reference_gdr', False)
-                and query.is_cuda
+        present = None
+        if use_cache:
+            rule = self.gated_delta_rule_attention
+            if seq_len > 1 and self._select_backend(query.device) == 'fla':
+                rule = self.gated_delta_rule_fla
+            core_attn_out, recurrent_state = rule(
+                query, key, value, g, beta, initial_state=initial_state, return_state=True,
             )
-            if use_fla:
-                core_attn_out = self.gated_delta_rule_fla(query, key, value, g, beta)
-            else:
-                core_attn_out = self.gated_delta_rule_attention(query, key, value, g, beta)
+            present = GatedDeltaNetCache(conv_state, recurrent_state.detach())
+        elif self._select_backend(query.device) == 'fla':
+            core_attn_out = self.gated_delta_rule_fla(query, key, value, g, beta)
         else:
-            core_attn_out = self.simple_gated_delta_attention(query, key, value, g, beta)
+            core_attn_out = self.gated_delta_rule_attention(query, key, value, g, beta)
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
@@ -263,7 +321,7 @@ class GatedDeltaNet(nn.Module):
 
         output = self.out_proj(core_attn_out)
         output = self.resid_dropout(output)
-        return output
+        return (output, present) if use_cache else output
 
     def gated_delta_rule_attention(
         self,
@@ -280,9 +338,8 @@ class GatedDeltaNet(nn.Module):
 
         The recurrent state is updated with the prediction residual rather than
         adding the value directly.  This is intentionally kept as a compact
-        PyTorch reference until a fused FLA/TileLang training kernel is wired in.
-        The loop is chunked so the dispatch boundary is explicit and can later be
-        replaced by a chunk kernel without changing the model interface.
+        PyTorch reference for single-token decoding and environments without FLA.
+        The loop is chunked to bound the temporary output lists.
 
         For each token, with ``S`` shaped ``[D_K, D_V]``:
 
@@ -304,8 +361,8 @@ class GatedDeltaNet(nn.Module):
         g = g.transpose(1, 2).contiguous()
 
         output_dtype = query.dtype
-        query = l2norm(query, dim=-1).float()
-        key = l2norm(key, dim=-1).float()
+        query = l2norm(query.float(), dim=-1).to(output_dtype).float()
+        key = l2norm(key.float(), dim=-1).to(output_dtype).float()
         value = value.float()
         beta = beta.float()
         g = g.float()
@@ -358,7 +415,7 @@ class GatedDeltaNet(nn.Module):
         output = output.transpose(1, 2).contiguous().to(dtype=output_dtype)
         return (output, state) if return_state else output
 
-    def gated_delta_rule_fla(self, query, key, value, g, beta):
+    def gated_delta_rule_fla(self, query, key, value, g, beta, initial_state=None, return_state=False):
         """Fused FLA chunk kernel for the gated delta rule.
 
         Numerically equivalent to :meth:`gated_delta_rule_attention` (the
@@ -369,8 +426,8 @@ class GatedDeltaNet(nn.Module):
         ``g``/``beta`` are ``[B, T, H]`` — exactly the public calling layout
         used by :meth:`forward`, so no transposes are needed here.
 
-        Only the plain forward recurrence is supported; stateful calls
-        (``initial_state``/``return_state``) still go through the reference.
+        Cached prefill and multi-token continuations use FLA's initial/final
+        state interface, with the default [B, H, Dk, Dv] state layout.
         """
         if _fla_chunk_gdr is None:
             raise RuntimeError(
@@ -393,7 +450,14 @@ class GatedDeltaNet(nn.Module):
             scale=scale,
             use_qk_l2norm_in_kernel=True,
             chunk_size=self.chunk_size,
+            initial_state=initial_state,
+            output_final_state=return_state,
         )
+        if return_state:
+            if not isinstance(out, tuple) or len(out) != 2 or out[1] is None:
+                raise RuntimeError("FLA kernel did not return the requested final recurrent state")
+            output, state = out
+            return output.to(dtype=output_dtype), state.float()
         out = out[0] if isinstance(out, tuple) else out
         return out.to(dtype=output_dtype)
 
@@ -405,92 +469,6 @@ class GatedDeltaNet(nn.Module):
         x = x * torch.rsqrt(variance + 1e-6)
         x = x * F.silu(gate.float())
         return x.to(input_dtype)
-
-    def simple_gated_delta_attention(self, query, key, value, g, beta, chunk_size=None):
-        """Chunked Gated Delta Attention — 分块并行计算，替代逐时间步Python循环
-
-        将序列分成 chunk_size 大小的块，块内用矩阵乘法并行计算，
-        块间传递 recurrent state。将 Python 循环从 T 次降到 T/chunk_size 次。
-        """
-        chunk_size = self.chunk_size if chunk_size is None else chunk_size
-        if chunk_size < 1:
-            raise ValueError("chunk_size must be positive")
-
-        query = query.transpose(1, 2).contiguous()
-        key = key.transpose(1, 2).contiguous()
-        value = value.transpose(1, 2).contiguous()
-        beta = beta.transpose(1, 2).contiguous()
-        g = g.transpose(1, 2).contiguous()
-
-        query = l2norm(query, dim=-1)
-        key = l2norm(key, dim=-1)
-        scale = 1 / (query.shape[-1] ** 0.5)
-        query = query * scale
-
-        batch_size, num_heads, seq_len, head_dim = query.shape
-        v_dim = value.shape[-1]
-
-        # g 已经是 log-space（负值），exp(g) 给出 (0,1) 的衰减因子
-        log_g = g  # (B, H, T)
-
-        num_chunks = (seq_len + chunk_size - 1) // chunk_size
-        output_chunks = []
-        recurrent_state = torch.zeros(batch_size, num_heads, head_dim, v_dim,
-                                      device=query.device, dtype=query.dtype)
-
-        for c in range(num_chunks):
-            start = c * chunk_size
-            end = min(start + chunk_size, seq_len)
-            C = end - start
-
-            q_c = query[:, :, start:end]       # (B, H, C, D)
-            k_c = key[:, :, start:end]         # (B, H, C, D)
-            v_c = value[:, :, start:end]       # (B, H, C, V)
-            beta_c = beta[:, :, start:end]     # (B, H, C)
-            log_g_c = log_g[:, :, start:end]   # (B, H, C)
-
-            # 块内 log 空间累积和：log_cg[i] = sum_{u=0}^{i} log(g[u])
-            log_cg = torch.cumsum(log_g_c, dim=-1)  # (B, H, C)
-
-            # === 块内：衰减加权线性注意力 ===
-            # 衰减比 log_ratio[i,j] = log_cg[i] - log_cg[j]，对应 g[j+1]*...*g[i]
-            log_ratio = log_cg.unsqueeze(-1) - log_cg.unsqueeze(-2)  # (B, H, C, C)
-            if chunk_size == self.chunk_size:
-                causal_mask = self.chunk_causal_mask[:C, :C]
-            else:
-                causal_mask = torch.tril(
-                    torch.ones(C, C, device=query.device, dtype=torch.bool)
-                )
-
-            # 衰减加权注意力矩阵
-            # clamp(max=0) 防止上三角 exp 溢出：exp(大正数) * mask(0) = inf*0 = NaN
-            qk = torch.matmul(q_c, k_c.transpose(-2, -1))  # (B, H, C, C)
-            decay_attn = torch.exp(log_ratio.clamp(max=0)) * causal_mask * qk  # (B, H, C, C)
-
-            v_beta = v_c * beta_c.unsqueeze(-1)  # (B, H, C, V)
-            intra_out = torch.matmul(decay_attn, v_beta)  # (B, H, C, V)
-
-            # === 块间：recurrent state 贡献 ===
-            inter_out = torch.exp(log_cg).unsqueeze(-1) * torch.matmul(q_c, recurrent_state)
-            # (B, H, C, 1) * (B, H, C, V) = (B, H, C, V)
-
-            output_chunks.append(intra_out + inter_out)
-
-            # === 更新 recurrent state 传给下一个 chunk ===
-            # 直接计算 exp(log_cg_last - log_cg) 而非 exp(-log_cg) * exp(log_cg_last)
-            # 因为 log_cg_last - log_cg <= 0，exp 不会溢出
-            log_decay_to_last = log_cg[:, :, -1:] - log_cg  # (B, H, C)，始终 <= 0
-            decay_weight = torch.exp(log_decay_to_last)      # (B, H, C)，(0, 1]
-            v_beta_weighted = v_beta * decay_weight.unsqueeze(-1)  # (B, H, C, V)
-            kv_sum = torch.matmul(k_c.transpose(-2, -1), v_beta_weighted)  # (B, H, D, V)
-
-            cg_last = torch.exp(log_cg[:, :, -1:])  # (B, H, 1)
-            recurrent_state = cg_last.unsqueeze(-1) * recurrent_state + kv_sum
-
-        output = torch.cat(output_chunks, dim=2)  # (B, H, T, V)
-        output = output.transpose(1, 2).contiguous()  # (B, T, H, V)
-        return output
-
 
 class FeedForward(nn.Module):
     """前馈网络"""
@@ -507,129 +485,6 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
-
-
-class MoEGate(nn.Module):
-    """MoE门控"""
-    def __init__(self, args):
-        super().__init__()
-        self.top_k = args.num_experts_per_tok
-        self.n_routed_experts = args.n_routed_experts
-        self.scoring_func = args.scoring_func
-        self.alpha = args.aux_loss_alpha
-        self.seq_aux = args.seq_aux
-        self.norm_topk_prob = args.norm_topk_prob
-        self.gating_dim = args.dim
-        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-
-    def forward(self, hidden_states):
-        bsz, seq_len, h = hidden_states.shape
-        hidden_states = hidden_states.view(-1, h)
-        logits = F.linear(hidden_states, self.weight, None)
-
-        if self.scoring_func == 'softmax':
-            scores = logits.softmax(dim=-1)
-        else:
-            raise NotImplementedError(f'Unsupported scoring function: {self.scoring_func}')
-
-        topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
-
-        if self.top_k > 1 and self.norm_topk_prob:
-            topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
-
-        aux_loss = None
-        if self.training and self.alpha > 0.0:
-            if self.seq_aux:
-                scores_for_seq_aux = scores.view(bsz, seq_len, -1)
-                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
-                ce.scatter_add_(1, topk_idx.view(bsz, -1),
-                                torch.ones(bsz, seq_len * self.top_k, device=hidden_states.device)
-                                ).div_(seq_len * self.top_k / self.n_routed_experts)
-                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
-            else:
-                mask_ce = F.one_hot(topk_idx.view(-1), num_classes=self.n_routed_experts)
-                ce = mask_ce.float().mean(0)
-                Pi = scores.mean(0)
-                fi = ce * self.n_routed_experts
-                aux_loss = (Pi * fi).sum() * self.alpha
-
-        return topk_idx, topk_weight, aux_loss
-
-
-class MOEFeedForward(nn.Module):
-    """MoE前馈网络"""
-    def __init__(self, args):
-        super().__init__()
-        self.args = args
-        self.experts = nn.ModuleList([
-            FeedForward(
-                dim=args.dim,
-                hidden_dim=args.hidden_dim,
-                multiple_of=args.multiple_of,
-                dropout=args.dropout,
-            )
-            for _ in range(args.n_routed_experts)
-        ])
-        self.gate = MoEGate(args)
-        if args.n_shared_experts:
-            self.shared_experts = FeedForward(
-                dim=args.dim,
-                hidden_dim=args.hidden_dim,
-                multiple_of=args.multiple_of,
-                dropout=args.dropout,
-            )
-
-    def forward(self, x):
-        identity = x
-        orig_shape = x.shape
-        bsz, seq_len, _ = x.shape
-
-        topk_idx, topk_weight, aux_loss = self.gate(x)
-
-        x = x.view(-1, x.shape[-1])
-        flat_topk_idx = topk_idx.view(-1)
-
-        if self.training:
-            x = x.repeat_interleave(self.args.num_experts_per_tok, dim=0)
-            y = torch.empty_like(x)
-            for i, expert in enumerate(self.experts):
-                mask = flat_topk_idx == i
-                if mask.any():
-                    y[mask] = expert(x[mask]).to(y.dtype)
-            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
-            y = y.view(*orig_shape)
-        else:
-            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
-
-        if self.args.n_shared_experts:
-            y = y + self.shared_experts(identity)
-
-        return y, aux_loss
-
-    @torch.no_grad()
-    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
-        expert_cache = torch.zeros_like(x)
-        idxs = flat_expert_indices.argsort()
-        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
-        token_idxs = idxs // self.args.num_experts_per_tok
-
-        for i, end_idx in enumerate(tokens_per_expert):
-            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
-            if start_idx == end_idx:
-                continue
-            expert = self.experts[i]
-            exp_token_idx = token_idxs[start_idx:end_idx]
-            expert_tokens = x[exp_token_idx]
-            expert_out = expert(expert_tokens)
-            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
-            expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)
-
-        return expert_cache
-
 
 class MindLMConfig(PretrainedConfig):
     """MindLM配置"""
@@ -650,15 +505,6 @@ class MindLMConfig(PretrainedConfig):
         norm_eps: float = 1e-6,           # RMSNorm 的 epsilon，防止除零
         hidden_dim: int = None,           # FFN 隐藏维度，None 时自动计算为 int(2*4*dim/3)
         multiple_of: int = 256,           # FFN hidden_dim 对齐到此值的倍数，提高硬件利用率
-        # ========== MoE 参数 ==========
-        use_moe: bool = True,             # 是否使用 MoE（混合专家）FFN，False 则用普通 SwiGLU FFN
-        n_routed_experts: int = 8,        # 路由专家总数（use_moe=True 时生效）
-        num_experts_per_tok: int = 2,     # 每个 token 激活的专家数（Top-K）
-        n_shared_experts: int = 1,        # 共享专家数（始终激活，不参与路由）
-        scoring_func: str = 'softmax',    # 路由评分函数，可选 'softmax' 或 'sigmoid'
-        aux_loss_alpha: float = 0.01,     # 负载均衡辅助损失系数
-        seq_aux: bool = True,             # 是否在序列级别计算辅助损失
-        norm_topk_prob: bool = True,      # 是否归一化 Top-K 专家概率权重
         # ========== 混合注意力架构 ==========
         use_linear_attn: bool = True,     # 是否启用混合注意力（False 则全部用标准 Attention）
         layer_types: List[str] = None,    # 每层的注意力类型列表，如 ["linear_attention","attention",...]
@@ -667,7 +513,8 @@ class MindLMConfig(PretrainedConfig):
         # ========== GatedDeltaNet 特定参数 ==========
         conv_kernel_size: int = 4,        # 因果卷积核大小，提供局部位置感知，替代位置编码
         linear_attn_chunk_size: int = 64, # 线性注意力块大小；须在训练前固定
-        linear_attn_impl: str = 'simple',  # 'simple' 兼容旧权重；'gated_delta_rule' 为完整规则
+        linear_attn_backend: str = 'fla',
+        attention_backend: str = 'flash_attn_4',
         # ========== 训练优化 ==========
         gradient_checkpointing: str = 'off',  # 梯度检查点策略：'off'=关闭，'linear_attn'=仅linear层，'all'=所有层
         **kwargs
@@ -685,16 +532,6 @@ class MindLMConfig(PretrainedConfig):
         self.hidden_dim = hidden_dim      # FFN 隐藏维度
         self.multiple_of = multiple_of    # FFN 维度对齐基数
 
-        # MoE 混合专家
-        self.use_moe = use_moe                      # 是否启用 MoE
-        self.n_routed_experts = n_routed_experts    # 路由专家数
-        self.num_experts_per_tok = num_experts_per_tok  # 每 token 激活专家数
-        self.n_shared_experts = n_shared_experts    # 共享专家数
-        self.scoring_func = scoring_func            # 路由评分函数
-        self.aux_loss_alpha = aux_loss_alpha        # 辅助损失系数
-        self.seq_aux = seq_aux                      # 序列级辅助损失
-        self.norm_topk_prob = norm_topk_prob        # 归一化专家概率
-
         # 混合注意力架构
         self.use_linear_attn = use_linear_attn      # 是否启用混合注意力
         if layer_types is None:
@@ -709,16 +546,21 @@ class MindLMConfig(PretrainedConfig):
         self.tie_word_embeddings = True         # tok_embeddings 和 output 共享权重
         self.conv_kernel_size = conv_kernel_size    # 因果卷积核大小
         self.linear_attn_chunk_size = linear_attn_chunk_size
-        self.linear_attn_impl = linear_attn_impl
+        self.linear_attn_backend = linear_attn_backend
+        self.attention_backend = attention_backend
         self.gradient_checkpointing = gradient_checkpointing  # 梯度检查点策略
         self.use_cache = False
 
         if dim % n_heads != 0:
             raise ValueError("dim must be divisible by n_heads")
+        if conv_kernel_size < 1:
+            raise ValueError("conv_kernel_size must be positive")
         if linear_attn_chunk_size < 1:
             raise ValueError("linear_attn_chunk_size must be positive")
-        if linear_attn_impl not in {'simple', 'gated_delta_rule'}:
-            raise ValueError("linear_attn_impl must be 'simple' or 'gated_delta_rule'")
+        if linear_attn_backend != 'fla':
+            raise ValueError("linear_attn_backend='fla' is required")
+        if attention_backend != 'flash_attn_4':
+            raise ValueError("attention_backend='flash_attn_4' is required")
         if n_kv_heads is not None and n_heads % n_kv_heads != 0:
             raise ValueError("n_heads must be divisible by n_kv_heads")
         if linear_attn_heads is not None and n_heads % linear_attn_heads != 0:
@@ -728,9 +570,6 @@ class MindLMConfig(PretrainedConfig):
         invalid_layer_types = set(self.layer_types) - {"attention", "linear_attention"}
         if invalid_layer_types:
             raise ValueError(f"Unsupported layer types: {sorted(invalid_layer_types)}")
-        if use_moe and not 1 <= num_experts_per_tok <= n_routed_experts:
-            raise ValueError("num_experts_per_tok must be between 1 and n_routed_experts")
-
 
 class TransformerBlock(nn.Module):
     """MindLM Transformer块"""
@@ -753,40 +592,31 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-        if args.use_moe:
-            self.feed_forward = MOEFeedForward(args)
-        else:
-            self.feed_forward = FeedForward(
-                dim=args.dim,
-                hidden_dim=args.hidden_dim,
-                multiple_of=args.multiple_of,
-                dropout=args.dropout,
-            )
+        self.feed_forward = FeedForward(
+            dim=args.dim,
+            hidden_dim=args.hidden_dim,
+            multiple_of=args.multiple_of,
+            dropout=args.dropout,
+        )
 
-    def _block_forward(self, x, pos_cis, kv_cache):
-        """整块前向（attention + FFN），用于 gradient checkpointing"""
-        attn_input = self.attention_norm(x)
-        if self.use_pos_cis:
-            h = x + self.attention(attn_input, pos_cis, kv_cache)
+    def _block_forward(self, x, pos_cis, past_key_value=None, use_cache=False):
+        """整块前向（attention + FFN），用于 gradient checkpointing。"""
+        attn_output = self.attention(self.attention_norm(x),
+                                     pos_cis if self.use_pos_cis else None,
+                                     past_key_value=past_key_value, use_cache=use_cache)
+        if use_cache:
+            attn_output, present = attn_output
         else:
-            h = x + self.attention(attn_input, None, kv_cache)
-
+            present = None
+        h = x + attn_output
         ffn_input = self.ffn_norm(h)
-        if isinstance(self.feed_forward, MOEFeedForward):
-            ffn_out, aux_loss = self.feed_forward(ffn_input)
-            out = h + ffn_out
-            return out, aux_loss
-        else:
-            out = h + self.feed_forward(ffn_input)
-            return out, None
+        return h + self.feed_forward(ffn_input), present
 
-    def forward(self, x, pos_cis=None, kv_cache=False):
+    def forward(self, x, pos_cis=None, past_key_value=None, use_cache=False):
         gc = self.args.gradient_checkpointing
-        if gc == 'all' or (gc == 'linear_attn' and self.layer_type == "linear_attention"):
-            return cp.checkpoint(self._block_forward, x, pos_cis, kv_cache,
-                                 use_reentrant=False)
-        return self._block_forward(x, pos_cis, kv_cache)
-
+        if self.training and (gc == 'all' or (gc == 'linear_attn' and self.layer_type == "linear_attention")):
+            return cp.checkpoint(self._block_forward, x, pos_cis, use_reentrant=False)
+        return self._block_forward(x, pos_cis, past_key_value, use_cache)
 
 class MindLM(PreTrainedModel, GenerationMixin):
     """MindLM主模型"""
@@ -822,22 +652,43 @@ class MindLM(PreTrainedModel, GenerationMixin):
         else:
             self.pos_cis = None
 
+        for layer in self.layers:
+            projection = layer.attention.out_proj if layer.layer_type == 'linear_attention' else layer.attention.wo
+            projection._mindlm_residual_projection = True
+            for name, module in layer.feed_forward.named_modules():
+                if name == 'w2' or name.endswith('.w2'):
+                    module._mindlm_residual_projection = True
+        # Apply the V3 scheme explicitly so every Linear/Embedding receives
+        # the intended initialization exactly once.
         self.apply(self._init_weights)
 
-        for pn, p in self.named_parameters():
-            if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
-                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layers))
-
-        self.aux_loss = 0.0
         self.post_init()
 
     def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            # The embedding and output head share one parameter.
+            if not getattr(module.weight, '_mindlm_v3_initialized', False):
+                std = 0.02 / math.sqrt(2 * self.config.n_layers) if getattr(module, '_mindlm_residual_projection', False) else 0.02
+                nn.init.normal_(module.weight, mean=0.0, std=std)
+                module.weight._mindlm_v3_initialized = True
+            if getattr(module, 'bias', None) is not None:
                 nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, GatedDeltaNet):
+            # ``post_init`` may be called again by callers after model
+            # construction (for example when integrating with
+            # Transformers utilities).  Keep the V3 initialization
+            # idempotent just like the tied embedding/output path above;
+            # re-sampling these recurrent parameters would silently alter
+            # a freshly loaded model.
+            if getattr(module, '_mindlm_v3_initialized', False):
+                return
+            with torch.no_grad():
+                amplitude = torch.empty_like(module.A_log).uniform_(0, 16).clamp_min_(torch.finfo(module.A_log.dtype).tiny)
+                module.A_log.copy_(amplitude.log())
+                dt = torch.exp(torch.empty_like(module.dt_bias).uniform_(math.log(0.001), math.log(0.1)))
+                module.dt_bias.copy_(dt + torch.log(-torch.expm1(-dt)))
+            module._mindlm_v3_initialized = True
+            return
 
     def mark_tied_weights_as_initialized(self, loading_info):
         """覆写父类方法：只标记已初始化，不从 missing_keys 中移除绑定权重。
@@ -854,13 +705,18 @@ class MindLM(PreTrainedModel, GenerationMixin):
         labels=None,
         tokens=None,
         targets=None,
+        return_logits=True,
+        past_key_values=None,
+        use_cache=None,
         **kwargs,
     ):
-        """Run a full causal-LM forward pass without a KV cache.
+        """Run training or cached inference on new tokens.
 
-        ``labels`` follows the Transformers convention: positions marked ``-100``
-        are ignored. ``tokens`` and ``targets`` remain as compatibility aliases for
-        the project's older scripts.
+        Pass the returned ``MindLMCache`` as ``past_key_values`` with only new
+        tokens. Cache use requires eval mode; training defaults to no cache.
+        Only unpadded batches are supported (``attention_mask`` must be all ones).
+        Labels are already shifted by the dataset; ``-100`` positions are ignored.
+        ``tokens`` and ``targets`` remain compatibility aliases.
         """
         if input_ids is None:
             input_ids = tokens
@@ -868,29 +724,43 @@ class MindLM(PreTrainedModel, GenerationMixin):
             labels = targets
         if input_ids is None:
             raise ValueError("input_ids is required")
+        if labels is not None and not return_logits:
+            raise ValueError("labels require return_logits=True")
 
-        _bsz, seqlen = input_ids.shape
-        if seqlen > self.config.max_seq_len:
+        if input_ids.ndim != 2 or input_ids.size(1) == 0:
+            raise ValueError("input_ids must have shape [batch, nonempty sequence]")
+        use_cache = self.config.use_cache if use_cache is None else use_cache
+        if past_key_values is not None and not use_cache:
+            raise ValueError("past_key_values requires use_cache=True")
+        if self.training and (use_cache or past_key_values is not None):
+            raise ValueError("Caching is only supported in eval mode; use model.eval()")
+        if labels is not None and use_cache:
+            raise ValueError("labels are not supported with use_cache=True")
+        bsz, seqlen = input_ids.shape
+        past_length = self._validate_cache(past_key_values, bsz, input_ids.device)
+        total_length = past_length + seqlen
+        if total_length > self.config.max_seq_len:
             raise ValueError(
-                f"Input length {seqlen} exceeds max_seq_len={self.config.max_seq_len}."
+                f"Input length including cache {total_length} exceeds max_seq_len={self.config.max_seq_len}."
             )
+        self._validate_attention_mask(attention_mask, bsz, total_length)
         h = self.tok_embeddings(input_ids)
         h = self.dropout(h)
 
         pos_cis = None
         if self.pos_cis is not None:
-            pos_cis = self.pos_cis[:seqlen]
+            pos_cis = self.pos_cis[past_length:total_length]
 
-        total_aux_loss = 0.0
-
-        for layer in self.layers:
-            h, aux_loss = layer(h, pos_cis, False)
-            if aux_loss is not None:
-                total_aux_loss += aux_loss
+        presents = []
+        for index, layer in enumerate(self.layers):
+            past = past_key_values.layers[index] if past_key_values is not None else None
+            h, present = layer(h, pos_cis, past_key_value=past, use_cache=use_cache)
+            if use_cache:
+                presents.append(present)
 
         h = self.norm(h)
 
-        logits = self.output(h)
+        logits = self.output(h) if return_logits else None
         loss = None
         if labels is not None:
             loss = F.cross_entropy(
@@ -898,17 +768,52 @@ class MindLM(PreTrainedModel, GenerationMixin):
                 labels.reshape(-1),
                 ignore_index=-100,
             )
-            if isinstance(total_aux_loss, torch.Tensor):
-                loss = loss + total_aux_loss
 
         return MindLMCausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=None,
+            past_key_values=MindLMCache(total_length, tuple(presents)) if use_cache else None,
             hidden_states=None,
             attentions=None,
-            aux_loss=total_aux_loss if isinstance(total_aux_loss, torch.Tensor) else None,
+            last_hidden_state=h if not return_logits else None,
         )
+
+    @staticmethod
+    def _validate_attention_mask(attention_mask, batch_size, seq_length):
+        if attention_mask is None:
+            return
+        if tuple(attention_mask.shape) != (batch_size, seq_length):
+            raise ValueError("attention_mask must have shape [batch, past length + new length]")
+        if not torch.all(attention_mask == 1):
+            raise ValueError("Only all-ones attention_mask is supported; padded or masked batches are not supported")
+
+    def _validate_cache(self, cache, batch_size, device):
+        if cache is None:
+            return 0
+        if not isinstance(cache, MindLMCache):
+            raise ValueError("past_key_values must be a MindLMCache returned by this model")
+        if type(cache.seq_length) is not int or not 0 < cache.seq_length <= self.config.max_seq_len:
+            raise ValueError("cache seq_length must be positive and at most max_seq_len")
+        if not isinstance(cache.layers, tuple) or len(cache.layers) != self.n_layers:
+            raise ValueError("cache layers must contain exactly one entry per model layer")
+        for layer, entry in zip(self.layers, cache.layers):
+            attn = layer.attention
+            if isinstance(attn, Attention):
+                if not isinstance(entry, AttentionCache):
+                    raise ValueError("attention layer requires AttentionCache")
+                shape = (batch_size, cache.seq_length, attn.n_local_kv_heads, attn.head_dim)
+                _validate_cache_tensor(entry.key, shape, device, "attention key cache")
+                _validate_cache_tensor(entry.value, shape, device, "attention value cache")
+            else:
+                if not isinstance(entry, GatedDeltaNetCache):
+                    raise ValueError("linear_attention layer requires GatedDeltaNetCache")
+                _validate_cache_tensor(entry.conv_state,
+                                       (batch_size, attn.conv_dim, attn.conv_kernel_size - 1),
+                                       device, "GDN convolution cache")
+                _validate_cache_tensor(entry.recurrent_state,
+                                       (batch_size, attn.num_v_heads, attn.head_k_dim, attn.head_v_dim),
+                                       device, "GDN recurrent cache", torch.float32)
+        return cache.seq_length
 
     @torch.inference_mode()
     def generate(
@@ -921,12 +826,14 @@ class MindLM(PreTrainedModel, GenerationMixin):
         temperature=0.7,
         top_k=8,
         eos=None,
+        use_cache=True,
+        attention_mask=None,
         **kwargs,
     ):
-        """Generate tokens with a compact Transformers-compatible interface.
+        """Generate with one prefill followed by cached single-token steps.
 
-        MindLM currently recomputes the full context at each step because neither
-        its standard attention nor DeltaNet path exposes a KV/state cache.
+        Set ``use_cache=False`` to recompute the full context at each step.
+        Generation temporarily uses eval mode and restores the prior mode.
         """
         if input_ids is None:
             input_ids = kwargs.pop("idx", None)
@@ -946,35 +853,49 @@ class MindLM(PreTrainedModel, GenerationMixin):
         else:
             eos_token_ids = {eos_token_id}
 
+        if input_ids.ndim != 2 or input_ids.size(1) == 0:
+            raise ValueError("input_ids must have shape [batch, nonempty sequence]")
+        if input_ids.size(1) > self.config.max_seq_len:
+            raise ValueError(f"Input length exceeds max_seq_len={self.config.max_seq_len}")
+        self._validate_attention_mask(attention_mask, input_ids.size(0), input_ids.size(1))
         generated = input_ids
+        past_key_values = None
         unfinished = torch.ones(generated.size(0), dtype=torch.bool, device=generated.device)
-        for _ in range(max_new_tokens):
-            if generated.size(1) >= self.config.max_seq_len:
-                break
-
-            logits = self(generated).logits[:, -1, :]
-            if do_sample and temperature > 0:
-                logits = logits / temperature
-                if top_k is not None and top_k > 0:
-                    threshold = torch.topk(logits, min(top_k, logits.size(-1))).values[:, [-1]]
-                    logits = logits.masked_fill(logits < threshold, -float("inf"))
-                probabilities = F.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probabilities, num_samples=1)
-            else:
-                next_token = logits.argmax(dim=-1, keepdim=True)
-
-            next_token = torch.where(
-                unfinished.unsqueeze(-1),
-                next_token,
-                torch.full_like(next_token, pad_token_id),
-            )
-            generated = torch.cat((generated, next_token), dim=1)
-            if eos_token_ids:
-                is_eos = torch.zeros_like(unfinished)
-                for token_id in eos_token_ids:
-                    is_eos |= next_token.squeeze(-1).eq(token_id)
-                unfinished &= ~is_eos
-                if not unfinished.any():
+        was_training = self.training
+        self.eval()
+        try:
+            for _ in range(max_new_tokens):
+                if generated.size(1) >= self.config.max_seq_len:
                     break
+
+                model_input = generated[:, -1:] if past_key_values is not None else generated
+                result = self(model_input, past_key_values=past_key_values, use_cache=use_cache)
+                past_key_values = result.past_key_values
+                logits = result.logits[:, -1, :]
+                if do_sample and temperature > 0:
+                    logits = logits / temperature
+                    if top_k is not None and top_k > 0:
+                        threshold = torch.topk(logits, min(top_k, logits.size(-1))).values[:, [-1]]
+                        logits = logits.masked_fill(logits < threshold, -float("inf"))
+                    probabilities = F.softmax(logits, dim=-1)
+                    next_token = torch.multinomial(probabilities, num_samples=1)
+                else:
+                    next_token = logits.argmax(dim=-1, keepdim=True)
+
+                next_token = torch.where(
+                    unfinished.unsqueeze(-1),
+                    next_token,
+                    torch.full_like(next_token, pad_token_id),
+                )
+                generated = torch.cat((generated, next_token), dim=1)
+                if eos_token_ids:
+                    is_eos = torch.zeros_like(unfinished)
+                    for token_id in eos_token_ids:
+                        is_eos |= next_token.squeeze(-1).eq(token_id)
+                    unfinished &= ~is_eos
+                    if not unfinished.any():
+                        break
+        finally:
+            self.train(was_training)
 
         return generated
