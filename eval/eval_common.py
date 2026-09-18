@@ -17,8 +17,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Every current model config (0.1b / 0.1b_moe / 0.2b_gdn / 0.7b) is trained with
-# the Qwen3 tokenizer; the small legacy tokenizer only serves old checkpoints.
+# Every current model config uses the Qwen3 tokenizer and the GDN V3 model
+# contract.
 DEFAULT_TOKENIZER_DIR = "qwen3_tokenizer"
 
 
@@ -41,13 +41,12 @@ def default_tokenizer_path(override: str = None) -> str:
 
 
 def load_checkpoint_with_tokenizer_check(model, checkpoint_path: str, device, tokenizer):
-    """Load a checkpoint, turning a vocabulary mismatch into an actionable error.
+    """Load a V3 checkpoint, turning a vocabulary mismatch into an actionable error.
 
     ``build_model_config`` adopts ``len(tokenizer)`` as the model vocabulary, so
     running a checkpoint with the wrong tokenizer otherwise surfaces as a raw
     ``RuntimeError: size mismatch for tok_embeddings.weight`` from
-    ``load_state_dict``. Returns the checkpoint metadata (may be an empty dict
-    for legacy raw state dicts).
+    ``load_state_dict``. Returns standardized checkpoint metadata.
     """
     from training_utils import load_model_checkpoint
 

@@ -7,7 +7,7 @@ Answers, with measurements:
      (b1s4096 -> b8s4096) and whether 4096-long sequences are inherently
      problematic vs raw token count (compare b8s4096 = 32k tokens against
      the Run 1 baseline 32x2048 = 65k tokens).
-  3. Static config facts that decide the fix: linear_attn_impl, FLA kernel
+  3. Static config facts that decide the fix: FLA kernel availability,
      availability, gradient checkpointing policy.
 
 Each case is isolated: OOM in one case does not abort the probe.
@@ -115,7 +115,7 @@ def get_model(device):
     from training_utils import build_model_config
 
     tok = AutoTokenizer.from_pretrained(f"{REPO}/qwen3_tokenizer", trust_remote_code=True)
-    config = build_model_config("mindlm_0.1b", tok)
+    config = build_model_config("mindlm_0.2b_gdn", tok)
     model = MindLM(config).to(device)
     model.train()
     _MODEL["model"] = model
@@ -132,7 +132,7 @@ def model_fwd_bwd(batch, seqlen, device="cuda"):
     mask[:, -int(seqlen * 0.57):] = 1  # assistant tail supervised, as in real data
     from training_utils import masked_language_model_loss
     out = model(input_ids=x)
-    loss = masked_language_model_loss(out.logits, x, mask, out.aux_loss)
+    loss = masked_language_model_loss(out.logits, x, mask)
     loss.backward()
     model.zero_grad(set_to_none=True)
     return {"tokens_per_micro": batch * seqlen}
@@ -147,7 +147,7 @@ def case_static(device="cuda"):
     sys.path.insert(0, REPO)
     import modeling_mindlm as mm
     return {
-        "linear_attn_impl": getattr(cfg, "linear_attn_impl", None),
+        "linear_attn_backend": getattr(cfg, "linear_attn_backend", None),
         "fla_kernel_available": getattr(mm, "_fla_chunk_gdr", None) is not None,
         "gradient_checkpointing": getattr(cfg, "gradient_checkpointing", None),
         "max_seq_len": cfg.max_seq_len,

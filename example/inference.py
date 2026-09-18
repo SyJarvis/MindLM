@@ -3,7 +3,7 @@
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-MODEL_PATH = "./mindlm-0.1b-sft"
+MODEL_PATH = "./mindlm-0.2b-gdn-sft"
 
 
 def load_model(model_path=MODEL_PATH, device="cpu"):

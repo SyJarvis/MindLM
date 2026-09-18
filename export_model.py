@@ -22,7 +22,7 @@ def export_model(config_name, checkpoint_path, output_dir, dtype="bfloat16", tok
     导出模型为 HuggingFace transformers 格式
 
     Args:
-        config_name: 模型配置名 (如 mindlm_0.1b)
+        config_name: 模型配置名 (如 mindlm_0.2b_gdn)
         checkpoint_path: .pth 权重文件路径
         output_dir: 输出目录
         dtype: 权重精度 (bfloat16/float16/float32)
@@ -35,9 +35,7 @@ def export_model(config_name, checkpoint_path, output_dir, dtype="bfloat16", tok
 
     # 2. 加载与模型词表匹配的 tokenizer
     if tokenizer_path is None:
-        tokenizer_path = str(
-            project_root / ("qwen3_tokenizer" if config_name == "mindlm_0.7b" else "mindlm_tokenizer")
-        )
+        tokenizer_path = str(project_root / "qwen3_tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     print(f"Tokenizer 词表大小: {len(tokenizer)}")
 
@@ -116,7 +114,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="MindLM 模型导出")
-    parser.add_argument("--config", choices=("mindlm_0.1b", "mindlm_0.1b_moe", "mindlm_0.7b"), default="mindlm_0.1b",
+    parser.add_argument("--config", choices=("mindlm_0.2b_gdn",), default="mindlm_0.2b_gdn",
                         help="模型配置名")
     parser.add_argument("--checkpoint", type=str, required=True,
                         help="权重文件路径 (.pth)")

@@ -10,6 +10,7 @@ from transformers import AutoTokenizer
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from eval.eval_common import supported_configs
 from modeling_mindlm import MindLM
 from training_utils import build_model_config, load_model_checkpoint
 
@@ -54,7 +55,7 @@ def chat(model, tokenizer, messages, device, max_new_tokens=256, temperature=0.7
 
 def main():
     parser = argparse.ArgumentParser(description="MindLM SFT evaluation")
-    parser.add_argument("--config", choices=("mindlm_0.1b", "mindlm_0.1b_moe", "mindlm_0.7b"), default="mindlm_0.1b")
+    parser.add_argument("--config", choices=supported_configs(), default="mindlm_0.2b_gdn")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--tokenizer_path", default=None)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")

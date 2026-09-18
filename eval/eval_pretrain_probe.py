@@ -50,7 +50,7 @@ def parse_prompts(spec):
 
 def main():
     parser = argparse.ArgumentParser(description="MindLM pretraining generation probe")
-    parser.add_argument("--config", choices=supported_configs(), default="mindlm_0.1b")
+    parser.add_argument("--config", choices=supported_configs(), default="mindlm_0.2b_gdn")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--tokenizer_path", default=None)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")

@@ -46,7 +46,7 @@ class HeldoutPackedDataset(Dataset):
 
 def main():
     parser = argparse.ArgumentParser(description="MindLM pretraining held-out PPL")
-    parser.add_argument("--config", choices=supported_configs(), default="mindlm_0.1b")
+    parser.add_argument("--config", choices=supported_configs(), default="mindlm_0.2b_gdn")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--tokenizer_path", default=None)
     parser.add_argument("--packed_prefix", required=True, help="Packed held-out <prefix>.bin/.json")

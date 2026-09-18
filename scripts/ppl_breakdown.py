@@ -69,7 +69,7 @@ def load_document_spans(documents_path, split="heldout"):
 
 def main():
     parser = argparse.ArgumentParser(description="Per-source held-out NLL breakdown")
-    parser.add_argument("--config", choices=supported_configs(), default="mindlm_0.1b")
+    parser.add_argument("--config", choices=supported_configs(), default="mindlm_0.2b_gdn")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--tokenizer_path", default=None)
     parser.add_argument("--packed_prefix", required=True)
