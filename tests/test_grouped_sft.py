@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-import full_sft_packed as trainer
+import full_sft as trainer
 import training_utils
 from modeling_mindlm import MindLM, MindLMConfig
 
@@ -33,7 +33,7 @@ class GroupedDataTest(unittest.TestCase):
             dataset = self.make_dataset(
                 directory,
                 [10, 11, 12, 13, 20, 21, 22, 23, 24],
-                [{"off": 0, "n": 4, "ans": 1}, {"off": 4, "n": 5, "ans": 3}],
+                [{"off": 0, "n": 4, "sup": [[2, 1]]}, {"off": 4, "n": 5, "sup": [[1, 3]]}],
             )
             x, y, mask = dataset[0]
             self.assertEqual(x.tolist(), [10, 11, 12])
@@ -46,14 +46,14 @@ class GroupedDataTest(unittest.TestCase):
 
     def test_invalid_metadata_is_rejected_before_training(self):
         invalid_records = [
-            {"off": -1, "n": 4, "ans": 1},
-            {"off": 0.5, "n": 4, "ans": 1},
-            {"off": 0, "n": 1, "ans": 1},
-            {"off": 0, "n": 5, "ans": 1},
-            {"off": 2, "n": 4, "ans": 1},
-            {"off": 0, "n": 4, "ans": 0},
-            {"off": 0, "n": 4, "ans": -3},
-            {"off": 0, "n": 4, "ans": 4},
+            {"off": -1, "n": 4, "sup": [[0, 1]]},
+            {"off": 0.5, "n": 4, "sup": [[0, 1]]},
+            {"off": 0, "n": 1, "sup": [[0, 1]]},
+            {"off": 0, "n": 5, "sup": [[0, 1]]},
+            {"off": 2, "n": 4, "sup": [[0, 1]]},
+            {"off": 0, "n": 4, "sup": []},
+            {"off": 0, "n": 4, "sup": [[0, 0]]},
+            {"off": 0, "n": 4, "sup": [[0, 4]]},
         ]
         with tempfile.TemporaryDirectory() as directory:
             for record in invalid_records:
@@ -206,7 +206,7 @@ class GroupedTrainingTest(unittest.TestCase):
         rows = [(4, 1), (5, 3), (7, 2), (8, 4), (6, 1)]
         tokens, records = [], []
         for index, (length, answer) in enumerate(rows):
-            records.append({"off": len(tokens), "n": length, "ans": answer})
+            records.append({"off": len(tokens), "n": length, "sup": [[length - 1 - answer, answer]]})
             tokens.extend([index + 1] + [((index + position) % 20) + 6 for position in range(length - 1)])
         bin_path, meta_path = Path(directory) / "tokens.bin", Path(directory) / "rows.jsonl"
         np.array(tokens, dtype=np.uint32).tofile(bin_path)
@@ -222,7 +222,7 @@ class GroupedTrainingTest(unittest.TestCase):
         output_dir = Path(directory)
         output_dir.mkdir()
         argv = [
-            "full_sft_packed.py", "--bin", str(bin_path), "--meta", str(meta_path),
+            "full_sft.py", "--bin", str(bin_path), "--meta", str(meta_path),
             "--resume_from", str(resume or initial_path), "--out_dir", str(output_dir),
             "--device", "cpu", "--num_workers", "0", "--epochs", str(epochs),
             "--max_batch_count", "1", "--token_budget", "100", "--mega_batch", "3",

@@ -18,8 +18,7 @@ def small_config(**overrides):
     values = dict(dim=32, n_layers=2, n_heads=4, n_kv_heads=2, linear_attn_heads=2,
                   vocab_size=67, max_seq_len=16, hidden_dim=64, multiple_of=8,
                   use_moe=False, layer_types=["attention", "linear_attention"],
-                  linear_attn_impl="gated_delta_rule", linear_attn_backend="reference",
-                  attention_backend="sdpa", initialization_scheme="gdn_v3")
+                  linear_attn_backend="fla", attention_backend="flash_attn_4")
     values.update(overrides)
     return MindLMConfig(**values)
 
@@ -29,26 +28,24 @@ class GDNV3ConfigAndInitializationTest(unittest.TestCase):
         config = MindLMConfig(**load_config("mindlm_0.2b_gdn"))
         self.assertEqual((config.dim, config.n_layers, config.n_heads, config.n_kv_heads), (768, 16, 12, 3))
         self.assertEqual((config.linear_attn_heads, config.dim // config.n_heads), (3, 64))
-        self.assertEqual((config.vocab_size, config.max_seq_len, config.dropout, config.use_moe), (151669, 4096, 0, False))
+        self.assertEqual((config.vocab_size, config.max_seq_len, config.dropout), (151669, 4096, 0))
         self.assertEqual(config.layer_types.count("linear_attention"), 12)
         self.assertEqual(config.layer_types.count("attention"), 4)
-        expected = dict(linear_attn_impl="gated_delta_rule", linear_attn_backend="fla",
-                        attention_backend="flash_attn_4", initialization_scheme="gdn_v3",
+        expected = dict(linear_attn_backend="fla",
+                        attention_backend="flash_attn_4",
                         gradient_checkpointing="all", conv_kernel_size=4)
         restored = MindLMConfig.from_dict(config.to_dict())
         for name, value in expected.items():
             self.assertEqual(getattr(config, name), value)
             self.assertEqual(getattr(restored, name), value)
-        legacy = MindLMConfig()
-        self.assertEqual((legacy.linear_attn_impl, legacy.linear_attn_backend,
-                          legacy.attention_backend, legacy.initialization_scheme), ("simple", "auto", "sdpa", "legacy"))
+        baseline = MindLMConfig()
+        self.assertEqual((baseline.linear_attn_backend, baseline.attention_backend),
+                         ("fla", "flash_attn_4"))
 
-    def test_invalid_backend_and_initialization_choices_are_rejected(self):
-        for name in ("linear_attn_backend", "attention_backend", "initialization_scheme"):
+    def test_invalid_backend_choices_are_rejected(self):
+        for name in ("linear_attn_backend", "attention_backend"):
             with self.subTest(field=name), self.assertRaises(ValueError):
                 small_config(**{name: "unknown"})
-        with self.assertRaisesRegex(ValueError, "requires linear_attn_impl"):
-            small_config(linear_attn_impl="simple", linear_attn_backend="fla")
 
     def test_final_initialization_scales_residuals_once_and_exempts_gates_from_decay(self):
         torch.manual_seed(404)
@@ -99,9 +96,7 @@ class GDNV3NumericsTest(unittest.TestCase):
         gate = torch.zeros(1, 2, 1)
         beta = torch.ones_like(gate)
         actual = module.gated_delta_rule_attention(q, q, value, gate, beta)
-        additive = module.simple_gated_delta_attention(q, q, value, gate, beta)
         torch.testing.assert_close(actual.flatten(), torch.tensor([1, 1]) / math.sqrt(2), rtol=0, atol=2e-6)
-        self.assertAlmostEqual(float(additive[0, 1, 0, 0]), 2 / math.sqrt(2), delta=2e-6)
 
     def test_full_gdr_output_state_and_all_input_gradients_match_affine_oracle(self):
         torch.manual_seed(405)
@@ -189,8 +184,7 @@ class GDNV3BackendTest(unittest.TestCase):
                 module._select_backend(torch.device("cuda"))
         with mock.patch.object(modeling_mindlm, "_fla_chunk_gdr", mock.Mock()):
             self.assertEqual(module._select_backend(torch.device("cuda")), "fla")
-        module.linear_attn_backend = "reference"
-        self.assertEqual(module._select_backend(torch.device("cuda")), "reference")
+        self.assertEqual(module._select_backend(torch.device("cpu")), "reference")
 
     def test_fa4_forward_passes_native_gqa_and_unpacks_tuple(self):
         config = small_config(dim=48, n_heads=12, n_kv_heads=3, attention_backend="flash_attn_4")

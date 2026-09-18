@@ -1,20 +1,20 @@
 """Grouped-batch SFT training for MindLM.
 
 Replaces the fixed-length padded SFT loop with token-bin inputs produced by
-``prepare_sft_bins.py``. Sequences are grouped by similar length so batches
+``prepare_data.py --type sft``. Sequences are grouped by similar length so batches
 stay tight; per-batch padding is bounded by the longest sequence in the group
 instead of a global max. Loss masking (assistant-only) is precomputed during
 tokenization and stored in the bin metadata, so this loop only needs to slice
 tokens and masks — no per-step re-rendering.
 
 Run:
-  python3 full_sft_packed.py \
+  python3 full_sft.py \
     --bin data/sft_tokens_4096.bin --meta data/sft_tokens_4096.rows.jsonl \
-    --model_config mindlm_0.1b \
-    --resume_from out_pretrain_minimind_pb/mindlm_pretrain_mindlm_0.1b_epoch2.pt \
+    --model_config mindlm_0.2b_gdn \
+    --resume_from out/mindlm_pretrain_mindlm_0.2b_gdn_epoch2.pt \
     --resume_weights_only \
     --token_budget 8192 --accumulation_steps 4 --epochs 2 --learning_rate 5e-5 \
-    --use_wandb --wandb_run_name mindlm_0.1b_sft_grouped
+    --use_wandb --wandb_run_name mindlm_0.2b_gdn_sft_grouped
 """
 import argparse
 import hashlib
@@ -57,11 +57,16 @@ class GroupedSFTDataset(Dataset):
             for line_number, line in enumerate(fh, 1):
                 digest.update(line.encode("utf-8"))
                 record = json.loads(line)
-                if not all(type(record.get(key)) is int for key in ("off", "n", "ans")):
-                    raise ValueError(f"metadata line {line_number}: off, n and ans must be integers")
-                off, n, ans = record["off"], record["n"], record["ans"]
-                if off < 0 or n < 2 or off + n > len(self.tokens) or not 1 <= ans < n:
-                    raise ValueError(f"metadata line {line_number}: invalid token bounds or answer length: {record}")
+                if not all(type(record.get(key)) is int for key in ("off", "n")) or not isinstance(record.get("sup"), list):
+                    raise ValueError(f"metadata line {line_number}: off, n and sup are required")
+                off, n, sup = record["off"], record["n"], record["sup"]
+                if off < 0 or n < 2 or off + n > len(self.tokens) or not sup:
+                    raise ValueError(f"metadata line {line_number}: invalid token bounds or sup intervals: {record}")
+                for interval in sup:
+                    if (not isinstance(interval, list) or len(interval) != 2 or
+                            any(type(x) is not int for x in interval) or interval[0] < 0 or
+                            interval[1] < 1 or interval[0] + interval[1] > n - 1):
+                        raise ValueError(f"metadata line {line_number}: invalid sup interval: {record}")
                 self.records.append(record)
         if not self.records:
             raise ValueError("empty metadata file")
@@ -77,8 +82,8 @@ class GroupedSFTDataset(Dataset):
         X = seq[:-1]
         Y = seq[1:]
         mask = torch.zeros_like(Y)
-        # Y drops the first prompt token, so every answer token remains a target.
-        mask[-rec["ans"]:] = 1
+        for start, length in rec["sup"]:
+            mask[start:start + length] = 1
         return X, Y, mask
 
 
@@ -150,7 +155,7 @@ def parse_args():
     parser.add_argument("--bin", default="data/sft_tokens_4096.bin")
     parser.add_argument("--meta", default="data/sft_tokens_4096.rows.jsonl")
     parser.add_argument("--tokenizer_path", default="qwen3_tokenizer")
-    parser.add_argument("--model_config", default="mindlm_0.1b")
+    parser.add_argument("--model_config", default="mindlm_0.2b_gdn")
     parser.add_argument("--out_dir", default="out")
     parser.add_argument("--resume_from", required=True)
     parser.add_argument("--resume_weights_only", action="store_true")
@@ -191,14 +196,12 @@ def parse_args():
 
 def grouped_forward_loss(model, input_ids, targets, loss_mask, chunk_tokens=256, reduction="sum"):
     """Dense MindLM backbone followed by the checkpointed, supervised-only head."""
-    if model.config.use_moe:
-        raise ValueError("grouped SFT currently supports dense models only; MoE auxiliary loss weighting is not defined")
     if input_ids.size(1) > model.config.max_seq_len:
         raise ValueError("input length exceeds model max_seq_len")
     h = model.dropout(model.tok_embeddings(input_ids))
     pos_cis = model.pos_cis[:input_ids.size(1)] if model.pos_cis is not None else None
     for layer in model.layers:
-        h, _ = layer(h, pos_cis, False)
+        h, _ = layer(h, pos_cis)
     h = model.norm(h)
     return masked_lm_head_loss(model.output, h, targets, loss_mask, chunk_tokens, reduction=reduction)
 
@@ -220,12 +223,10 @@ def main():
     config = build_model_config(args.model_config, tokenizer)
     if args.gradient_checkpointing is not None:
         config.gradient_checkpointing = args.gradient_checkpointing
-    if config.use_moe:
-        raise ValueError("grouped SFT currently supports dense models only; MoE auxiliary loss weighting is not defined")
     config_fields = (
         "dim", "n_layers", "n_heads", "n_kv_heads", "linear_attn_heads", "vocab_size",
-        "max_seq_len", "dropout", "norm_eps", "hidden_dim", "multiple_of", "use_moe",
-        "layer_types", "conv_kernel_size", "linear_attn_chunk_size", "linear_attn_impl",
+        "max_seq_len", "dropout", "norm_eps", "hidden_dim", "multiple_of",
+        "layer_types", "conv_kernel_size", "linear_attn_chunk_size",
     )
     config_signature = {key: getattr(config, key) for key in config_fields}
     # Load on CPU: weights-only starts must not leave checkpoint optimizer tensors on GPU.
@@ -314,7 +315,7 @@ def main():
     log(f"Grouped SFT: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params, "
         f"{len(dataset)} sequences, updates/epoch={updates_by_epoch}, total_updates={total_updates}, "
         f"start_update={global_update}, token_budget={args.token_budget}, loss_chunk={args.loss_chunk_tokens}, "
-        f"gradient_checkpointing={config.gradient_checkpointing}, linear_attn_impl={config.linear_attn_impl}")
+        f"gradient_checkpointing={config.gradient_checkpointing}")
 
     checkpoint_path = Path(args.out_dir) / "mindlm_sft_grouped_latest.pt"
     epoch = start_epoch

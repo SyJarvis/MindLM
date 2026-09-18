@@ -1,12 +1,12 @@
-"""Compatibility CLI for the legacy fixed-length SFT trainer."""
+"""MindLM SFT entry point."""
 
 import sys
-from trainers import sft_legacy as _impl
+from trainers import sft_grouped as _impl
 
-# Preserve the historical module surface for imports and monkeypatching.
+# Keep the implementation module surface available to existing imports.
 sys.modules[__name__] = _impl
-from trainers.sft_legacy import *
-from trainers.sft_legacy import main
+from trainers.sft_grouped import *
+from trainers.sft_grouped import main
 
 
 if __name__ == "__main__":

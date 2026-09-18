@@ -26,15 +26,20 @@ class Tokenizer:
     def __len__(self):
         return 32
     def get_vocab(self):
-        return {str(i): i for i in range(32)}
+        vocab = {str(i): i for i in range(32)}
+        vocab["<|im_end|>"] = 1
+        return vocab
+    def convert_tokens_to_ids(self, token):
+        return self.get_vocab().get(token, 0)
+    all_special_tokens = []
 
 
 class PretrainV3Test(unittest.TestCase):
     def config(self, dropout=0):
         return MindLMConfig(dim=16, n_layers=2, n_heads=4, n_kv_heads=2, linear_attn_heads=2,
-            vocab_size=32, max_seq_len=6, hidden_dim=32, multiple_of=8, use_moe=False,
-            layer_types=["attention", "linear_attention"], dropout=dropout, linear_attn_impl="gated_delta_rule",
-            linear_attn_backend="reference", attention_backend="sdpa", initialization_scheme="gdn_v3", gradient_checkpointing="off")
+            vocab_size=32, max_seq_len=6, hidden_dim=32, multiple_of=8,
+            layer_types=["attention", "linear_attention"], dropout=dropout,
+            linear_attn_backend="fla", attention_backend="flash_attn_4", gradient_checkpointing="off")
 
     def inputs(self, directory):
         for name, count, offset in [("train", 5, 0), ("val", 3, 10)]:
@@ -42,13 +47,14 @@ class PretrainV3Test(unittest.TestCase):
             np.array([[i + offset + 1] + [(i + j + offset) % 20 + 6 for j in range(6)] for i in range(count)],
                      dtype=np.uint32).tofile(prefix.with_suffix(".bin"))
             prefix.with_suffix(".json").write_text(json.dumps({"format": "mindlm_packed_pretrain_v1", "dtype": "uint32",
-                "sequence_length": 6, "tokens_per_record": 7, "num_sequences": count, "tokenizer_vocab_size": 32}))
+                "loss_mask_dtype": "uint8", "sequence_length": 6, "tokens_per_record": 7, "num_sequences": count,
+                "tokenizer_vocab_size": 32, "boundary_token": "<|im_end|>", "boundary_token_id": 1}))
         return Path(directory) / "train", Path(directory) / "val"
 
     def run_main(self, directory, inputs, config, resume=None, limit=0, accumulation=2, epochs=2, extra=()):
-        argv = ["pretrain.py", "--model_config", "mindlm_0.2b_gdn", "--packed_data_prefix", str(inputs[0]),
-            "--val_packed_data_prefix", str(inputs[1]), "--tokenizer_path", str(inputs[0].parent / "tokenizer"),
-            "--out_dir", str(directory), "--batch_size", "2", "--accumulation_steps", str(accumulation),
+        argv = ["pretrain.py", "--model_config", "mindlm_0.2b_gdn", "--train_data_prefix", str(inputs[0]),
+            "--validation_data_prefix", str(inputs[1]), "--tokenizer_path", str(inputs[0].parent / "tokenizer"),
+            "--output_dir", str(directory), "--batch_size", "2", "--gradient_accumulation_steps", str(accumulation),
             "--epochs", str(epochs), "--warmup_updates", "0", "--learning_rate", "0.003", "--grad_clip", "1000000",
             "--device", "cpu", "--dtype", "float32", "--num_workers", "0", "--loss_chunk_tokens", "3",
             "--save_interval", "1", "--eval_interval", "1", "--log_interval", "1", "--limit_updates", str(limit)]
@@ -125,7 +131,7 @@ class PretrainV3Test(unittest.TestCase):
             for stop, complete_epoch in [(1, False), (2, True)]:
                 path, partial, seen1, updates1, _ = self.run_main(Path(directory) / f"stop{stop}", inputs, config, limit=stop)
                 self.assertEqual(partial["epoch_complete"], complete_epoch)
-                self.assertEqual(partial["extra_state"]["pretrain_v3"]["contract"]["total_updates"], 4)
+                self.assertEqual(partial["extra_state"]["pretrain"]["contract"]["total_updates"], 4)
                 torch.manual_seed(987)
                 _, resumed, seen2, updates2, _ = self.run_main(Path(directory) / f"resume{stop}", inputs, config, resume=path)
                 self.equal(seen, seen1 + seen2)
@@ -139,7 +145,7 @@ class PretrainV3Test(unittest.TestCase):
             _, original, _, _, _ = self.run_main(Path(directory) / "first", inputs, self.config(), limit=1)
             for key in ("config", "train", "val", "tokenizer", "runtime"):
                 checkpoint = copy.deepcopy(original)
-                contract = checkpoint["extra_state"]["pretrain_v3"]["contract"]
+                contract = checkpoint["extra_state"]["pretrain"]["contract"]
                 if key == "config":
                     contract[key]["linear_attn_impl"] = "simple"
                     checkpoint["config"]["linear_attn_impl"] = "simple"
@@ -151,7 +157,7 @@ class PretrainV3Test(unittest.TestCase):
                     self.run_main(Path(directory) / key, inputs, self.config(), resume=path)
             path = Path(directory) / "legacy.pt"
             torch.save({"model": original["model"], "training_stage": "pretrain"}, path)
-            with self.assertRaisesRegex(ValueError, "complete V3 checkpoint"):
+            with self.assertRaisesRegex(ValueError, "complete pretraining checkpoint"):
                 self.run_main(Path(directory) / "legacy", inputs, self.config(), resume=path)
 
     def test_heldout_token_mean_preserves_rng_gradient_and_train_mode(self):
@@ -161,9 +167,9 @@ class PretrainV3Test(unittest.TestCase):
             model = MindLM(self.config(0.2)).train()
             for p in model.parameters():
                 p.grad = torch.zeros_like(p)
-            before = pretrain.v3_rng_state(torch.device("cpu"))
-            metrics = pretrain.evaluate_v3(model, loader, torch.device("cpu"), "float32", 3)
-            self.equal(pretrain.v3_rng_state(torch.device("cpu")), before)
+            before = pretrain.capture_rng_state(torch.device("cpu"))
+            metrics = pretrain.evaluate(model, loader, torch.device("cpu"), "float32", 3)
+            self.equal(pretrain.capture_rng_state(torch.device("cpu")), before)
             self.assertTrue(model.training)
             self.assertTrue(all(torch.count_nonzero(p.grad).item() == 0 for p in model.parameters()))
             model.eval()
@@ -179,7 +185,7 @@ class PretrainV3Test(unittest.TestCase):
         model = MindLM(self.config())
         marked = model.layers[0].attention.wq.weight
         marked._no_weight_decay = True
-        optimizer = pretrain.v3_optimizer(model, 0.003, 0.1, False)
+        optimizer = pretrain.build_optimizer(model, 0.003, 0.1, False)
         groups = {id(p): g["weight_decay"] for g in optimizer.param_groups for p in g["params"]}
         for name, p in model.named_parameters():
             exempt = p.ndim < 2 or name.endswith(("bias", "A_log", "dt_bias")) or p is marked
@@ -190,7 +196,7 @@ class PretrainV3Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             inputs = self.inputs(directory)
             path, checkpoint, _, _, _ = self.run_main(Path(directory) / "first", inputs, self.config(), limit=1)
-            with self.assertRaisesRegex(ValueError, "without existing V3 checkpoints"):
+            with self.assertRaisesRegex(ValueError, "without existing pretraining checkpoints"):
                 self.run_main(path.parent, inputs, self.config())
             for name in ("learning_rate", "weight_decay", "grad_clip"):
                 with self.assertRaisesRegex(ValueError, "invalid warmup"):

@@ -93,13 +93,10 @@ def chunked_masked_ce_loss(logits: torch.Tensor, targets: torch.Tensor, loss_mas
     return loss_sum / denom, denom
 
 
-def masked_language_model_loss(logits, targets, loss_mask, aux_loss=None, chunk_tokens=4096):
-    """Return mean token loss over ``loss_mask`` plus an optional MoE loss."""
+def masked_language_model_loss(logits, targets, loss_mask, chunk_tokens=4096):
+    """Return mean token loss over ``loss_mask``."""
     token_loss, _ = chunked_masked_ce_loss(logits, targets, loss_mask, chunk_tokens)
-    loss = token_loss
-    if aux_loss is not None:
-        loss = loss + aux_loss
-    return loss
+    return token_loss
 
 
 def load_model_checkpoint(model, checkpoint_path, map_location, allow_partial_load=False):
@@ -112,32 +109,22 @@ def load_model_checkpoint(model, checkpoint_path, map_location, allow_partial_lo
             "Warning: partially loaded checkpoint; "
             f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
         )
-    return checkpoint if "model" in checkpoint else {}
+    return checkpoint
 
 
 def extract_model_state(checkpoint):
-    """Accept legacy state dicts and the standardized MindLM checkpoint format."""
+    """Extract model weights from a standardized MindLM checkpoint."""
     if not isinstance(checkpoint, dict):
-        raise TypeError("Checkpoint must be a state dict or a MindLM checkpoint dictionary.")
-
-    if "model" in checkpoint:
-        state_dict = checkpoint["model"]
-    elif "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
-    elif "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    else:
-        state_dict = checkpoint
+        raise TypeError("MindLM checkpoint must be a dictionary.")
+    state_dict = checkpoint.get("model")
+    if not isinstance(state_dict, dict):
+        raise ValueError("MindLM checkpoint must contain a 'model' state dictionary.")
 
     if not isinstance(state_dict, dict):
         raise TypeError("Checkpoint model state is not a state dictionary.")
 
     normalized = {}
     for key, value in state_dict.items():
-        if key.startswith("module."):
-            key = key.removeprefix("module.")
-        if key.startswith("_orig_mod."):
-            key = key.removeprefix("_orig_mod.")
         normalized[key] = value
     return normalized
 

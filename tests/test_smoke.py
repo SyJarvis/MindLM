@@ -25,7 +25,7 @@ except ImportError:
 
 @unittest.skipIf(torch is None, "PyTorch and project dependencies are required")
 class MindLMSmokeTest(unittest.TestCase):
-    def make_config(self, use_moe=False):
+    def make_config(self):
         return MindLMConfig(
             dim=16,
             n_layers=2,
@@ -36,32 +36,15 @@ class MindLMSmokeTest(unittest.TestCase):
             max_seq_len=12,
             hidden_dim=32,
             multiple_of=8,
-            use_moe=use_moe,
-            n_routed_experts=2,
-            num_experts_per_tok=1,
-            n_shared_experts=1,
             layer_types=["attention", "linear_attention"],
         )
 
-    def test_dense_and_moe_forward(self):
+    def test_dense_forward(self):
         input_ids = torch.randint(0, 32, (2, 6))
 
         dense = MindLM(self.make_config()).eval()
         dense_output = dense(input_ids=input_ids)
         self.assertEqual(tuple(dense_output.logits.shape), (2, 6, 32))
-        self.assertIsNone(dense_output.aux_loss)
-
-        moe = MindLM(self.make_config(use_moe=True)).train()
-        moe_output = moe(input_ids=input_ids)
-        self.assertEqual(tuple(moe_output.logits.shape), (2, 6, 32))
-        self.assertIsNotNone(moe_output.aux_loss)
-        self.assertGreaterEqual(moe_output.aux_loss.item(), 0.0)
-
-        full_config = self.make_config()
-        full_config.linear_attn_impl = "gated_delta_rule"
-        full = MindLM(full_config).eval()
-        full_output = full(input_ids=input_ids)
-        self.assertEqual(tuple(full_output.logits.shape), (2, 6, 32))
 
     def test_masked_loss_and_context_limited_generation(self):
         logits = torch.tensor([[[2.0, 0.0], [0.0, 2.0]]])
@@ -128,10 +111,13 @@ class MindLMSmokeTest(unittest.TestCase):
                     {
                         "format": "mindlm_packed_pretrain_v1",
                         "dtype": "uint32",
+                        "loss_mask_dtype": "uint8",
                         "sequence_length": 4,
                         "tokens_per_record": 5,
                         "num_sequences": 2,
                         "tokenizer_vocab_size": 32,
+                        "boundary_token": "<|im_end|>",
+                        "boundary_token_id": 8,
                     },
                     file,
                 )
@@ -146,7 +132,6 @@ class MindLMSmokeTest(unittest.TestCase):
 
     def test_complete_gated_delta_rule_matches_token_recurrence_and_backpropagates(self):
         config = self.make_config()
-        config.linear_attn_impl = "gated_delta_rule"
         module = GatedDeltaNet(config).double()
         batch, length = 2, 5
         heads, dim = module.num_v_heads, module.head_v_dim

@@ -14,7 +14,7 @@ from training_utils import build_model_config, masked_language_model_loss
 
 def parse_args():
     parser = argparse.ArgumentParser(description="MindLM synthetic train-step benchmark")
-    parser.add_argument("--model_config", choices=("mindlm_0.1b", "mindlm_0.1b_moe", "mindlm_0.7b"), default="mindlm_0.7b")
+    parser.add_argument("--model_config", choices=("mindlm_0.2b_gdn",), default="mindlm_0.2b_gdn")
     parser.add_argument("--tokenizer_path", default="qwen3_tokenizer")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seq_len", type=int, default=2048)
@@ -58,7 +58,7 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         with autocast_context:
             outputs = model(input_ids=input_ids)
-            loss = masked_language_model_loss(outputs.logits, targets, loss_mask, outputs.aux_loss)
+            loss = masked_language_model_loss(outputs.logits, targets, loss_mask)
         loss.backward()
         optimizer.step()
         return loss
