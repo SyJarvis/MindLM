@@ -3,10 +3,11 @@ import argparse
 import csv
 import json
 import struct
+from pathlib import Path
 
 from transformers import AutoTokenizer
 
-REPO = "/home/runke.zhong.srv/workspace/MindLM"
+REPO = str(Path(__file__).resolve().parents[1])
 
 
 def main():
@@ -24,14 +25,9 @@ def main():
     stats = {"total": 0, "errors": 0, "over_long": 0, "tokens": 0, "answer_tokens": 0}
     lengths = []
 
-    bos_ids = tok("<|im_start|>assistant\n", add_special_tokens=False).input_ids
+    assistant_ids = tok("<|im_start|>assistant\n", add_special_tokens=False).input_ids
+    im_end_ids = tok("<|im_end|>", add_special_tokens=False).input_ids
 
-    def find_last_sublist(hay, needle):
-        n = len(needle)
-        for i in range(len(hay) - n, -1, -1):
-            if hay[i:i + n] == needle:
-                return i
-        return -1
 
     out = open(args.bin, "wb")
     meta = open(args.meta, "w", encoding="utf-8")
@@ -51,25 +47,43 @@ def main():
                 stats["errors"] += 1
                 continue
 
-            marker = find_last_sublist(ids, bos_ids)
-            answer_start = marker + len(bos_ids)
-            if marker < 0 or answer_start >= len(ids):
-                stats["errors"] += 1
-                continue
 
             keep = min(len(ids), args.max_tokens)
             if len(ids) > args.max_tokens:
                 stats["over_long"] += 1
 
+            # Store supervised target intervals after rendering.  Coordinates
+            # are in the shifted Y=ids[1:] array and include each assistant
+            # body plus its closing <|im_end|> token.
+            sup = []
+            cursor = 0
+            while cursor <= keep - len(assistant_ids):
+                if ids[cursor:cursor + len(assistant_ids)] != assistant_ids:
+                    cursor += 1
+                    continue
+                body_start = cursor + len(assistant_ids)
+                end = next((i for i in range(body_start, keep - len(im_end_ids) + 1)
+                            if ids[i:i + len(im_end_ids)] == im_end_ids), None)
+                if end is None:
+                    break
+                # seq index s is target index s-1 in Y; ignore header itself.
+                target_start = max(0, body_start - 1)
+                target_end = min(keep - 1, end + len(im_end_ids) - 1)
+                if target_start < target_end:
+                    sup.append([target_start, target_end - target_start])
+                cursor = end + len(im_end_ids)
+            if not sup:
+                stats["errors"] += 1
+                continue
             out.write(struct.pack(f"<{keep}I", *ids[:keep]))
             meta.write(json.dumps({
                 "off": stats["tokens"],
                 "n": keep,
-                "ans": keep - answer_start,
+                "sup": sup,
                 "src": row.get("source", ""),
             }) + "\n")
             stats["tokens"] += keep
-            stats["answer_tokens"] += keep - answer_start
+            stats["answer_tokens"] += sum(length for _, length in sup)
             lengths.append(keep)
     out.close()
     meta.close()

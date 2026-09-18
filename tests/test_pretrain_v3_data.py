@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from scripts import prepare_pretrain_v3 as prep
+from data_process import pretrain as prep
 
 
 class ByteTokenizer:
@@ -16,6 +16,11 @@ class ByteTokenizer:
 
     def __len__(self):
         return 257
+
+    def get_vocab(self):
+        return {"<|im_end|>": 256}
+    def convert_tokens_to_ids(self, token):
+        return 256
 
     def __call__(self, texts, add_special_tokens=False):
         assert add_special_tokens is False
@@ -106,7 +111,7 @@ class PretrainV3DataTests(unittest.TestCase):
                 added = ids[-1] != tokenizer.eos_token_id
                 self.assertEqual(record['stream_offset'], len(expected))
                 self.assertEqual(record['source_tokens'], len(ids))
-                self.assertEqual(record['eos_appended'], added)
+                self.assertEqual(record['boundary_appended'], added)
                 expected += ids + ([tokenizer.eos_token_id] if added else [])
                 source_stream[source] = source_stream.get(source, 0) + len(ids) + int(added)
             info = manifest['splits'][split]
@@ -175,7 +180,7 @@ class PretrainV3DataTests(unittest.TestCase):
         from tokenizers.models import WordLevel
         from tokenizers.pre_tokenizers import Whitespace
         from transformers import PreTrainedTokenizerFast
-        backend = Tokenizer(WordLevel({'[UNK]': 0, '[EOS]': 1, 'hello': 2, 'world': 3}, unk_token='[UNK]'))
+        backend = Tokenizer(WordLevel({'[UNK]': 0, '[EOS]': 1, 'hello': 2, 'world': 3, '<|im_end|>': 4}, unk_token='[UNK]'))
         backend.pre_tokenizer = Whitespace()
         tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, eos_token='[EOS]', unk_token='[UNK]')
         tokenizer.save_pretrained(self.tokenizer_dir)

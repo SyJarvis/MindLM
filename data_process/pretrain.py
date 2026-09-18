@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deduplicate documents, split stable groups, and pack independent V3 datasets."""
+"""Deduplicate documents, split stable groups, and pack independent datasets."""
 
 import argparse
 from collections import Counter, defaultdict, deque
@@ -20,6 +20,8 @@ import numpy as np
 
 
 FORMAT = 'mindlm_packed_pretrain_v1'
+MANIFEST_FORMAT = 'mindlm_pretrain_v1'
+CHAT_EOS_TOKEN = '<|im_end|>'
 _WORKER_TOKENIZER = None
 
 
@@ -162,6 +164,24 @@ def load_tokenizer(path):
     return AutoTokenizer.from_pretrained(path, local_files_only=True, trust_remote_code=False)
 
 
+def chat_eos_id(tokenizer):
+    """Return the explicit Qwen3 chat EOS token used as document boundary."""
+
+    convert = getattr(tokenizer, 'convert_tokens_to_ids', None)
+    if not callable(convert):
+        raise ValueError('tokenizer must expose convert_tokens_to_ids')
+    vocabulary = tokenizer.get_vocab()
+    if CHAT_EOS_TOKEN not in vocabulary:
+        raise ValueError(f'tokenizer does not contain {CHAT_EOS_TOKEN}')
+    token_id = convert(CHAT_EOS_TOKEN)
+    if token_id is None or isinstance(token_id, (list, tuple)):
+        raise ValueError(f'tokenizer does not contain {CHAT_EOS_TOKEN}')
+    token_id = int(token_id)
+    if not 0 <= token_id < len(tokenizer):
+        raise ValueError(f'invalid {CHAT_EOS_TOKEN} id: {token_id}')
+    return token_id
+
+
 def init_worker(tokenizer_path):
     global _WORKER_TOKENIZER
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -209,35 +229,37 @@ def encoded_batches(documents, args, tokenizer):
 
 
 class PackedWriter:
-    def __init__(self, directory, split, length, vocab_size, eos):
+    def __init__(self, directory, split, length, vocab_size, boundary_token_id):
         self.directory, self.split = directory, split
-        self.width, self.vocab_size, self.eos = length + 1, vocab_size, eos
+        self.width = length + 1
+        self.vocab_size = vocab_size
+        self.boundary_token_id = boundary_token_id
         self.path = directory / f'{split}.bin.tmp'
         self.stream = self.path.open('wb')
         self.buffer, self.buffer_sources = [], []
         self.sources = defaultdict(Counter)
-        self.documents = self.source_tokens = self.eos_added = self.records = 0
+        self.documents = self.source_tokens = self.boundary_tokens_added = self.records = 0
 
     def append(self, doc, token_ids):
         if not token_ids:
             raise ValueError(f'Nonempty document produced no tokens: input row {doc.input_row}')
         if min(token_ids) < 0 or max(token_ids) >= self.vocab_size:
             raise ValueError(f'Token id outside vocabulary: input row {doc.input_row}')
-        start = self.source_tokens + self.eos_added
-        add_eos = token_ids[-1] != self.eos
+        start = self.source_tokens + self.boundary_tokens_added
+        add_boundary = token_ids[-1] != self.boundary_token_id
         stats = self.sources[doc.source]
         stats['documents'] += 1
         stats['source_tokens'] += len(token_ids)
-        stats['eos_tokens_in_source'] += token_ids.count(self.eos)
-        stats['eos_appended'] += int(add_eos)
-        stats['stream_tokens'] += len(token_ids) + int(add_eos)
+        stats['boundary_tokens_in_source'] += token_ids.count(self.boundary_token_id)
+        stats['boundary_appended'] += int(add_boundary)
+        stats['stream_tokens'] += len(token_ids) + int(add_boundary)
         self.documents += 1
         self.source_tokens += len(token_ids)
-        self.eos_added += int(add_eos)
+        self.boundary_tokens_added += int(add_boundary)
         self.buffer.extend(token_ids)
         self.buffer_sources.extend([doc.source] * len(token_ids))
-        if add_eos:
-            self.buffer.append(self.eos)
+        if add_boundary:
+            self.buffer.append(self.boundary_token_id)
             self.buffer_sources.append(doc.source)
         complete = len(self.buffer) // self.width * self.width
         if complete:
@@ -245,7 +267,11 @@ class PackedWriter:
             self.records += complete // self.width
             self.buffer = self.buffer[complete:]
             self.buffer_sources = self.buffer_sources[complete:]
-        return {'stream_offset': start, 'source_tokens': len(token_ids), 'eos_appended': bool(add_eos)}
+        return {
+            'stream_offset': start,
+            'source_tokens': len(token_ids),
+            'boundary_appended': bool(add_boundary),
+        }
 
     def finish(self, input_path, input_sha):
         self.stream.close()
@@ -256,7 +282,7 @@ class PackedWriter:
             stats['discarded_tail_tokens'] = tail_by_source[source]
             stats['packed_tokens'] = stats['stream_tokens'] - tail_by_source[source]
         packed_tokens = self.records * self.width
-        assert packed_tokens + len(self.buffer) == self.source_tokens + self.eos_added
+        assert packed_tokens + len(self.buffer) == self.source_tokens + self.boundary_tokens_added
         assert sum(value['packed_tokens'] for value in self.sources.values()) == packed_tokens
         assert self.path.stat().st_size == packed_tokens * 4
         tokens = np.memmap(self.path, dtype='<u4', mode='r')
@@ -267,14 +293,19 @@ class PackedWriter:
         del tokens
         assert 0 <= minimum <= maximum < self.vocab_size
         return {
-            'format': FORMAT, 'dtype': '<u4', 'sequence_length': self.width - 1,
+            'format': FORMAT, 'dtype': '<u4', 'loss_mask_dtype': 'uint8',
+            'sequence_length': self.width - 1,
             'tokens_per_record': self.width, 'num_sequences': self.records,
-            'tokenizer_vocab_size': self.vocab_size, 'eos_token_id': self.eos,
+            'tokenizer_vocab_size': self.vocab_size,
+            'boundary_token': CHAT_EOS_TOKEN,
+            'boundary_token_id': self.boundary_token_id,
             'documents': self.documents, 'source_tokens': self.source_tokens,
-            'eos_appended': self.eos_added, 'stream_tokens': self.source_tokens + self.eos_added,
+            'boundary_appended': self.boundary_tokens_added,
+            'stream_tokens': self.source_tokens + self.boundary_tokens_added,
             'packed_tokens': packed_tokens, 'supervised_tokens': self.records * (self.width - 1),
             'discarded_tail_tokens': len(self.buffer), 'discarded_tail_by_source': dict(tail_by_source),
-            'source_statistics': dict(self.sources), 'add_eos': True,
+            'source_statistics': dict(self.sources),
+            'add_boundary': True,
             'min_token_id': minimum, 'max_token_id': maximum, 'sha256': sha256_file(self.path),
             'size_bytes': self.path.stat().st_size, 'source_csv': str(input_path), 'source_sha256': input_sha,
         }
@@ -299,10 +330,10 @@ def prepare(args):
         scan_seconds = time.monotonic() - scan_started
         print(f'scan audit={json.dumps(audit)}', flush=True)
         tokenizer = load_tokenizer(str(args.tokenizer_path))
-        vocab_size, eos = len(tokenizer), tokenizer.eos_token_id
-        if not 0 < vocab_size <= np.iinfo(np.uint32).max or eos is None or not 0 <= eos < vocab_size:
-            raise ValueError('Tokenizer requires uint32-compatible vocabulary and a valid EOS')
-        writers = [PackedWriter(args.output_dir, split, args.max_seq_len, vocab_size, eos) for split in ('train', 'heldout')]
+        vocab_size, boundary_token_id = len(tokenizer), chat_eos_id(tokenizer)
+        if not 0 < vocab_size <= np.iinfo(np.uint32).max or not 0 <= boundary_token_id < vocab_size:
+            raise ValueError('Tokenizer requires uint32-compatible vocabulary and a valid Qwen3 chat EOS token')
+        writers = [PackedWriter(args.output_dir, split, args.max_seq_len, vocab_size, boundary_token_id) for split in ('train', 'heldout')]
         index_tmp = args.output_dir / 'documents.jsonl.tmp'
         processed = 0
         tokenization_started = time.monotonic()
@@ -326,7 +357,7 @@ def prepare(args):
             raise RuntimeError('Input CSV changed during preparation')
         split_metadata = {writer.split: writer.finish(args.input_csv, input_sha) for writer in writers}
         manifest = {
-            'format': 'mindlm_pretrain_v3_split_v1', 'status': 'complete',
+            'format': MANIFEST_FORMAT, 'status': 'complete',
             'input': {'path': str(args.input_csv), 'size_bytes': input_stat.st_size, 'mtime_ns': input_stat.st_mtime_ns, 'sha256': input_sha},
             'tokenizer': tokenizer_info,
             'policy': {
@@ -336,7 +367,7 @@ def prepare(args):
                 'split': 'uint64_bigendian(SHA256(ascii(seed)+/heldout/+group_digest)[:8]) < floor(heldout_ppm*2**64/1000000)',
                 'mixing': 'sort by SHA256(ascii(seed)+/mix/+full_digest), then full_digest',
                 'tokenized_text': 'original text with outer strip; internal whitespace and code indentation preserved',
-                'packing': 'independent split streams; append EOS unless last token is EOS; nonoverlapping sequence_length+1 records; drop final incomplete record',
+                'packing': 'independent split streams; append Qwen3 chat EOS unless last token is chat EOS; nonoverlapping sequence_length+1 records; drop final incomplete record',
                 'limitation': 'Exact/group overlap audited; arbitrary semantic or non-prefix near duplicates are not guaranteed removed',
             },
             'audit': audit, 'splits': split_metadata,

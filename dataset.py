@@ -45,7 +45,7 @@ class PretrainDataset(Dataset):
 
 
 class PackedPretrainDataset(Dataset):
-    """Memory-map fixed-length, EOS-delimited pretraining token blocks.
+    """Memory-map fixed-length, Qwen3 chat-EOS-delimited token blocks.
 
     ``prepare_pretrain_data.py`` writes ``<prefix>.bin`` and ``<prefix>.json``.
     Every stored record has ``max_length + 1`` real tokens, so this dataset avoids
@@ -54,6 +54,7 @@ class PackedPretrainDataset(Dataset):
     """
 
     FORMAT = "mindlm_packed_pretrain_v1"
+    BOUNDARY_TOKEN = "<|im_end|>"
 
     def __init__(self, prefix, max_length, tokenizer_vocab_size=None):
         super().__init__()
@@ -74,6 +75,20 @@ class PackedPretrainDataset(Dataset):
                 f"Packed sequence length is {metadata.get('sequence_length')}, "
                 f"but the model requires {max_length}."
             )
+        if metadata.get("boundary_token") != self.BOUNDARY_TOKEN:
+            raise ValueError(
+                "Packed dataset must use the Qwen3 chat EOS boundary "
+                f"{self.BOUNDARY_TOKEN!r}"
+            )
+        boundary_token_id = metadata.get("boundary_token_id")
+        if (
+            not isinstance(boundary_token_id, int)
+            or isinstance(boundary_token_id, bool)
+            or boundary_token_id < 0
+        ):
+            raise ValueError("Packed dataset boundary_token_id must be a non-negative integer")
+        if metadata.get("loss_mask_dtype") != "uint8":
+            raise ValueError("Packed dataset loss_mask_dtype must be uint8")
         if tokenizer_vocab_size is not None and metadata.get("tokenizer_vocab_size") != tokenizer_vocab_size:
             raise ValueError(
                 "Packed dataset tokenizer vocabulary does not match the selected tokenizer: "
@@ -84,6 +99,8 @@ class PackedPretrainDataset(Dataset):
         self.tokens_per_record = metadata.get("tokens_per_record")
         self.num_sequences = metadata.get("num_sequences")
         dtype = np.dtype(metadata.get("dtype", "uint32"))
+        if dtype != np.dtype("uint32"):
+            raise ValueError("Packed dataset token dtype must be uint32")
         if self.tokens_per_record != max_length + 1:
             raise ValueError("Packed dataset record width must be max_length + 1")
         if not isinstance(self.num_sequences, int) or self.num_sequences < 1:
@@ -102,7 +119,10 @@ class PackedPretrainDataset(Dataset):
             dtype=dtype,
             shape=(self.num_sequences, self.tokens_per_record),
         )
-        self.loss_mask = torch.ones(max_length, dtype=torch.int64)
+        # Packed pretraining has no padding. Keep the in-memory mask compact
+        # and match the v1 on-disk ``uint8`` contract; the loss helper promotes
+        # it to fp32 when computing the weighted token mean.
+        self.loss_mask = torch.ones(max_length, dtype=torch.uint8)
 
     def __len__(self):
         return self.num_sequences

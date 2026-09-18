@@ -6,7 +6,7 @@ Pipeline (docs/pretraining_v2_plan.md §3-4, docs/handoff_v2_worklog.md §5):
   2. pretrain_t2t.jsonl        (Chinese t2t): full-MD5 dedup -> classify -> weighted keep -> sample to quota
   3. perfectblend_mathcode.csv (English math/code, ChatML already stripped): full pass
   -> shuffle -> tokenize (qwen3, add_special_tokens=False) -> pack into 4096+1 uint32
-  blocks with EOS 151645 between documents -> <prefix>.bin + <prefix>.json
+  blocks with Qwen3 chat EOS 151645 between documents -> <prefix>.bin + <prefix>.json
 
 The manifest passes PackedPretrainDataset validation (dataset.py): format,
 sequence_length, tokens_per_record, tokenizer_vocab_size, dtype, and
@@ -41,7 +41,8 @@ BASE = Path(__file__).resolve().parents[1]
 csv.field_size_limit(10**9)
 
 PACKED_FORMAT = "mindlm_packed_pretrain_v1"
-EOS_TOKEN_ID = 151645  # qwen3 tokenizer_config.json: eos_token <|im_end|> = 151645
+CHAT_EOS_TOKEN = "<|im_end|>"
+CHAT_EOS_ID = 151645
 
 # Same first-hit rules as scripts/profile_pretrain_data.py (T2T_RULES).
 T2T_RULES = [
@@ -228,6 +229,13 @@ def pack(corpus, tokenizer_path, tokens_path, max_seq_len, batch_rows):
 
     tok = Tokenizer.from_file(str(Path(tokenizer_path) / "tokenizer.json"))
     vocab_size = tok.get_vocab_size()
+    chat_eos_id = tok.token_to_id(CHAT_EOS_TOKEN)
+    if chat_eos_id is None:
+        raise ValueError(f"Tokenizer does not contain {CHAT_EOS_TOKEN}")
+    if chat_eos_id != CHAT_EOS_ID:
+        raise ValueError(
+            f"Expected {CHAT_EOS_TOKEN} to be {CHAT_EOS_ID}, got {chat_eos_id}"
+        )
     tokens_per_record = max_seq_len + 1
 
     tokens_path = Path(tokens_path)
@@ -265,8 +273,8 @@ def pack(corpus, tokenizer_path, tokens_path, max_seq_len, batch_rows):
                 source_tokens += len(ids)
                 per_source[src] = per_source.get(src, 0) + len(ids)
                 buffer.extend(ids)
-                if ids[-1] != EOS_TOKEN_ID:
-                    buffer.append(EOS_TOKEN_ID)
+                if ids[-1] != chat_eos_id:
+                    buffer.append(chat_eos_id)
                 flush_records(out_file)
             if (i // batch_rows) % 50 == 0:
                 elapsed = time.time() - t0
@@ -275,6 +283,7 @@ def pack(corpus, tokenizer_path, tokens_path, max_seq_len, batch_rows):
 
     stats = {
         "vocab_size": vocab_size,
+        "boundary_token_id": chat_eos_id,
         "documents": documents,
         "source_tokens": source_tokens,
         "source_token_breakdown": per_source,
@@ -340,16 +349,18 @@ def main():
     manifest = {
         "format": PACKED_FORMAT,
         "dtype": "uint32",
+        "loss_mask_dtype": "uint8",
         "sequence_length": args.max_seq_len,
         "tokens_per_record": args.max_seq_len + 1,
         "num_sequences": sequence_count,
         "tokenizer_vocab_size": pack_stats["vocab_size"],
-        "eos_token_id": EOS_TOKEN_ID,
+        "boundary_token": CHAT_EOS_TOKEN,
+        "boundary_token_id": pack_stats["boundary_token_id"],
         "documents": pack_stats["documents"],
         "source_tokens": pack_stats["source_tokens"],
         "source_token_breakdown": pack_stats["source_token_breakdown"],
         "discarded_tail_tokens": pack_stats["discarded_tail_tokens"],
-        "add_eos": True,
+        "add_boundary": True,
         "dry_run": args.dry_run,
         "mix_targets_tokens_est": {
             "pretrain_data": q[0],

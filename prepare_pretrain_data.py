@@ -1,4 +1,8 @@
-"""Pack CSV text into fixed-length, EOS-delimited pretraining token blocks."""
+"""Pack one CSV into fixed-length Qwen3 chat-EOS-delimited blocks.
+
+The canonical train/heldout pipeline is ``prepare_data.py --type pretrain``;
+this small utility is useful when a single stream is sufficient.
+"""
 
 import argparse
 import csv
@@ -12,6 +16,25 @@ from transformers import AutoTokenizer
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent
 PACKED_DATASET_FORMAT = "mindlm_packed_pretrain_v1"
+CHAT_EOS_TOKEN = "<|im_end|>"
+
+
+def chat_eos_id(tokenizer):
+    """Resolve the explicit Qwen3 chat EOS token used as document boundary."""
+
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if not callable(convert):
+        raise ValueError("tokenizer must expose convert_tokens_to_ids")
+    vocabulary = tokenizer.get_vocab()
+    if CHAT_EOS_TOKEN not in vocabulary:
+        raise ValueError(f"tokenizer does not contain {CHAT_EOS_TOKEN}")
+    token_id = convert(CHAT_EOS_TOKEN)
+    if token_id is None or isinstance(token_id, (list, tuple)):
+        raise ValueError(f"tokenizer does not contain {CHAT_EOS_TOKEN}")
+    token_id = int(token_id)
+    if not 0 <= token_id < len(tokenizer):
+        raise ValueError(f"invalid {CHAT_EOS_TOKEN} id: {token_id}")
+    return token_id
 
 
 def parse_args():
@@ -22,7 +45,6 @@ def parse_args():
     parser.add_argument("--text_column", default="text")
     parser.add_argument("--max_seq_len", type=int, default=4096)
     parser.add_argument("--batch_rows", type=int, default=1024)
-    parser.add_argument("--no_add_eos", action="store_true", help="Do not append EOS between source documents")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     if args.max_seq_len < 2:
@@ -58,9 +80,7 @@ def main():
             raise FileExistsError(f"{path} already exists; pass --overwrite to replace it")
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
-    eos_token_id = tokenizer.eos_token_id
-    if not args.no_add_eos and eos_token_id is None:
-        raise ValueError("The tokenizer has no eos_token_id; pass --no_add_eos only if intentional")
+    boundary_token_id = chat_eos_id(tokenizer)
     if len(tokenizer) > np.iinfo(np.uint32).max:
         raise ValueError("Tokenizer vocabulary exceeds uint32 storage")
 
@@ -87,8 +107,8 @@ def main():
                     source_documents += 1
                     source_tokens += len(token_ids)
                     buffer.extend(token_ids)
-                    if not args.no_add_eos and token_ids[-1] != eos_token_id:
-                        buffer.append(eos_token_id)
+                    if token_ids[-1] != boundary_token_id:
+                        buffer.append(boundary_token_id)
 
                     while len(buffer) - buffer_start >= tokens_per_record:
                         record = np.asarray(
@@ -114,15 +134,17 @@ def main():
     metadata = {
         "format": PACKED_DATASET_FORMAT,
         "dtype": "uint32",
+        "loss_mask_dtype": "uint8",
         "sequence_length": args.max_seq_len,
         "tokens_per_record": tokens_per_record,
         "num_sequences": sequence_count,
         "tokenizer_vocab_size": len(tokenizer),
-        "eos_token_id": eos_token_id,
+        "boundary_token": CHAT_EOS_TOKEN,
+        "boundary_token_id": boundary_token_id,
         "documents": source_documents,
         "source_tokens": source_tokens,
         "discarded_tail_tokens": len(buffer) - buffer_start,
-        "add_eos": not args.no_add_eos,
+        "add_boundary": True,
         "source_csv": str(Path(args.input_csv).resolve()),
     }
     with metadata_path.open("w", encoding="utf-8") as output_file:
