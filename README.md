@@ -64,36 +64,29 @@ only on the final answer tokens.
 
 ## Training
 
-Train the Dense baseline:
+Train MindLM pretraining from packed train/heldout streams:
 
 ```bash
 python pretrain.py \
-  --model_config mindlm_0.1b \
-  --data_path data/pretrain_data.csv \
-  --batch_size 64 \
-  --accumulation_steps 8
+  --model_config mindlm_0.2b_gdn \
+  --train_data_prefix data/packed/train \
+  --validation_data_prefix data/packed/heldout \
+  --batch_size 16 \
+  --gradient_accumulation_steps 8
 ```
 
-For the 0.7B design, use `--model_config mindlm_0.7b`; it defaults to the copied
-`qwen3_tokenizer/` directory. Older 0.1B checkpoints continue to use
-`mindlm_tokenizer/`. Pass `--tokenizer_path` to override either default.
+The trainer uses the copied `qwen3_tokenizer/` by default. The packed manifest must
+declare the Qwen3 chat EOS `<|im_end|>` as `boundary_token`.
 
-For 0.7B pretraining, pack variable-length source text into fixed token blocks before
-launching a long run. This removes short-sample padding from the training hot path:
-
-```bash
-python prepare_pretrain_data.py \
-  --input_csv data/pretrain_data.csv \
-  --output_prefix data/packed_qwen3_4096 \
-  --max_seq_len 4096
-```
-
-Train the MoE variant:
+Pack variable-length source text into fixed token blocks before launching a long run.
+This removes short-sample padding from the training hot path:
 
 ```bash
-python pretrain.py \
-  --model_config mindlm_0.1b_moe \
-  --data_path data/pretrain_data.csv
+python prepare_data.py --type pretrain \
+  --input-csv data/pretrain_data.csv \
+  --tokenizer-path qwen3_tokenizer \
+  --output-dir data/packed \
+  --max-seq-len 4096
 ```
 
 Fine-tune from a matching pretraining checkpoint:
@@ -105,20 +98,19 @@ python full_sft.py \
   --data_path data/sft_data_single.csv
 ```
 
-多卡训练使用 PyTorch DDP。`--batch_size` 是每张 GPU 的 batch size，实际 global
-batch size 为 `GPU 数 x batch_size x accumulation_steps`。例如 4 张卡训练 0.7B：
+`--batch_size` 是单进程读取的 batch size，实际 token 数还取决于
+`--gradient_accumulation_steps`。
 
 ```bash
-torchrun --nproc_per_node=4 pretrain.py \
-  --ddp \
-  --model_config mindlm_0.7b \
-  --packed_data_prefix data/packed_qwen3_4096 \
-  --batch_size 2 \
-  --accumulation_steps 8 \
-  --dtype bfloat16
+python pretrain.py \
+  --model_config mindlm_0.2b_gdn \
+  --train_data_prefix data/packed/train \
+  --validation_data_prefix data/packed/heldout \
+  --batch_size 16 \
+  --gradient_accumulation_steps 8
 ```
 
-这里的 global batch size 是 `4 x 2 x 8 = 64`。SFT 使用相同方式：
+SFT 使用各自的训练入口和参数。
 
 ```bash
 torchrun --nproc_per_node=4 full_sft.py \
@@ -180,7 +172,8 @@ qwen3_tokenizer/       Copied Qwen3-0.6B tokenizer files (no model weights)
 modeling_mindlm.py      Model, hybrid attention, and generation implementation
 dataset.py              Pretraining and answer-only SFT datasets
 training_utils.py       Shared config, loss, sampler, and checkpoint helpers
-prepare_pretrain_data.py  Offline EOS packing for padding-free pretraining
+prepare_data.py           Canonical train/heldout data preparation entry point
+prepare_pretrain_data.py  Single-stream Qwen3 chat-EOS packing utility
 bench_train_step.py     Synthetic train-step benchmark and profiler entry point
 pretrain.py             Pretraining entry point
 full_sft.py             Full SFT entry point
