@@ -139,6 +139,50 @@ class PretrainV3Test(unittest.TestCase):
                 for key in ("model", "optimizer", "scaler", "epoch", "step", "epoch_complete", "extra_state"):
                     self.equal(resumed[key], complete[key])
 
+    def test_resume_allows_runtime_tuning_and_restores_training_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs = self.inputs(directory)
+            config = self.config(0.2)
+            config.gradient_checkpointing = "all"
+            path, partial, _, _, _ = self.run_main(
+                Path(directory) / "first", inputs, config, limit=1
+            )
+            saved = partial["extra_state"]["pretrain"]
+            self.assertEqual(saved["version"], 2)
+            self.assertEqual(saved["next_record"], 4)
+            self.assertEqual(saved["last_metrics"]["update"], 1)
+            self.assertAlmostEqual(
+                saved["optimizer_step"]["learning_rate"],
+                partial["optimizer"]["param_groups"][0]["lr"],
+            )
+
+            _, resumed, _, resumed_updates, _ = self.run_main(
+                Path(directory) / "resumed",
+                inputs,
+                config,
+                resume=path,
+                extra=[
+                    "--batch_size", "1",
+                    "--gradient_accumulation_steps", "4",
+                    "--loss_chunk_tokens", "2",
+                    "--gradient_checkpointing", "off",
+                ],
+            )
+            resumed_state = resumed["extra_state"]["pretrain"]
+            self.assertEqual(resumed_state["contract"]["batch_size"], 1)
+            self.assertEqual(resumed_state["contract"]["gradient_accumulation_steps"], 4)
+            self.assertEqual(resumed_state["contract"]["loss_chunk_tokens"], 2)
+            self.assertEqual(resumed_state["contract"]["config"]["gradient_checkpointing"], "off")
+            self.assertEqual(resumed_state["schedule"], saved["schedule"])
+            self.assertGreaterEqual(resumed_state["global_update"], saved["global_update"])
+            expected_lr = pretrain.learning_rate_at(
+                saved["global_update"],
+                saved["schedule"]["total_updates"],
+                saved["schedule"]["warmup_updates"],
+                saved["schedule"]["base_learning_rate"],
+            )
+            self.assertAlmostEqual(resumed_updates[0]["lr"], expected_lr)
+
     def test_resume_rejects_math_data_tokenizer_runtime_changes_and_legacy_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
             inputs = self.inputs(directory)
@@ -221,7 +265,6 @@ class PretrainV3Test(unittest.TestCase):
         self.assertEqual(calls[1]["id"], handle.id)
         self.assertEqual(calls[1]["resume"], "must")
         self.assertEqual(partial["wandb_run_id"], resumed["wandb_run_id"])
-
 
 if __name__ == "__main__":
     unittest.main()

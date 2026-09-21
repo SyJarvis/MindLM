@@ -43,9 +43,20 @@ from training_utils import (
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent
 CHECKPOINT_STATE_KEY = "pretrain"
-CHECKPOINT_STATE_VERSION = 1
+CHECKPOINT_STATE_VERSION = 2
 CHAT_EOS_TOKEN = "<|im_end|>"
 HASH_BLOCK_BYTES = 8 * 1024 * 1024
+MUTABLE_RESUME_KEYS = frozenset({
+    "batch_size",
+    "gradient_accumulation_steps",
+    "loss_chunk_tokens",
+    "num_workers",
+    "total_updates",
+    "updates_per_epoch",
+    "warmup_updates",
+    "eval_batch_size",
+})
+MUTABLE_CONFIG_KEYS = frozenset({"gradient_checkpointing"})
 SOURCE_FILES = (
     "pretrain.py",
     "training_utils.py",
@@ -93,6 +104,7 @@ class TrainingCursor:
     """Position persisted in a checkpoint and used to resume exactly."""
 
     epoch: int = 0
+    next_record: int = 0
     next_batch: int = 0
     global_update: int = 0
 
@@ -123,6 +135,12 @@ def parse_args(argv=None):
         "--model_config",
         choices=("mindlm_0.2b_gdn",),
         default="mindlm_0.2b_gdn",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        choices=("off", "linear_attn", "all"),
+        default=None,
+        help="Override the config checkpointing policy; safe to change on resume",
     )
     parser.add_argument(
         "--resume_from", default=None, help="Complete MindLM pretraining checkpoint"
@@ -260,7 +278,7 @@ def validate_args(args):
 
 
 class ResumableBatchSampler:
-    """Deterministically shuffle records and skip an already consumed cursor."""
+    """Deterministically shuffle records and resume from a record cursor."""
 
     def __init__(self, dataset_size, batch_size, seed):
         if dataset_size < 1 or batch_size < 1:
@@ -269,21 +287,29 @@ class ResumableBatchSampler:
         self.batch_size = batch_size
         self.seed = seed
         self.epoch = 0
+        self.start_record = 0
         self.start_batch = 0
 
     def set_epoch(self, epoch):
         if epoch < 0:
             raise ValueError("epoch cannot be negative")
         self.epoch = epoch
+        self.start_record = 0
         self.start_batch = 0
 
+    def set_start_record(self, record):
+        if not 0 <= record <= self.dataset_size:
+            raise ValueError("start record must be within the dataset")
+        self.start_record = record
+        self.start_batch = math.ceil(record / self.batch_size)
+
     def __len__(self):
-        return max(math.ceil(self.dataset_size / self.batch_size) - self.start_batch, 0)
+        return math.ceil(max(self.dataset_size - self.start_record, 0) / self.batch_size)
 
     def __iter__(self):
         generator = torch.Generator().manual_seed(self.seed + self.epoch)
         order = torch.randperm(self.dataset_size, generator=generator).tolist()
-        first = self.start_batch * self.batch_size
+        first = self.start_record
         for start in range(first, self.dataset_size, self.batch_size):
             yield order[start : start + self.batch_size]
 
@@ -580,7 +606,7 @@ def build_training_contract(
     plan,
     eval_batch_size,
 ):
-    """Build the immutable contract that must match on resume."""
+    """Build the contract used to validate data and math on resume."""
 
     contract = {
         name: getattr(args, name)
@@ -619,6 +645,25 @@ def build_training_contract(
     if contract["train"]["bin_sha256"] == contract["val"]["bin_sha256"]:
         raise ValueError("training and validation token files are identical")
     return contract
+
+
+def _resume_contract_signature(contract):
+    """Return the immutable part of a contract for elastic resume checks."""
+
+    signature = dict(contract)
+    for key in MUTABLE_RESUME_KEYS:
+        signature.pop(key, None)
+    signature["config"] = _resume_config_signature(signature.get("config", {}))
+    return signature
+
+
+def _resume_config_signature(config):
+    """Return the immutable model configuration for checkpoint comparison."""
+
+    signature = dict(config)
+    for key in MUTABLE_CONFIG_KEYS:
+        signature.pop(key, None)
+    return signature
 
 
 def _seeded_loaders(
@@ -667,42 +712,68 @@ def _load_resume_state(path):
     if (
         metadata.get("training_stage") != "pretrain"
         or not isinstance(state, dict)
-        or state.get("version") != CHECKPOINT_STATE_VERSION
+        or state.get("version") not in (1, CHECKPOINT_STATE_VERSION)
     ):
         raise ValueError("pretraining resume requires a complete pretraining checkpoint")
     required = {"epoch", "next_batch", "global_update", "contract", "rng"}
     if not required <= state.keys():
         missing = sorted(required - state.keys())
         raise ValueError(f"pretraining checkpoint is missing state fields: {missing}")
+    if state["version"] == 1:
+        batch_size = state["contract"].get("batch_size")
+        if not isinstance(batch_size, int) or batch_size < 1:
+            raise ValueError("legacy pretraining checkpoint has invalid batch_size")
+        state = dict(state)
+        state["version"] = CHECKPOINT_STATE_VERSION
+        train_sequences = state["contract"].get("train", {}).get("num_sequences")
+        if not isinstance(train_sequences, int) or train_sequences < 1:
+            raise ValueError("legacy pretraining checkpoint has invalid train size")
+        state["next_record"] = min(state["next_batch"] * batch_size, train_sequences)
+        state["schedule"] = {
+            "total_updates": state["contract"].get("total_updates"),
+            "warmup_updates": state["contract"].get("warmup_updates"),
+            "base_learning_rate": state["contract"].get("learning_rate"),
+        }
+        optimizer_groups = metadata.get("optimizer", {}).get("param_groups", [])
+        state["optimizer_step"] = {
+            "learning_rate": optimizer_groups[0].get("lr") if optimizer_groups else None,
+        }
+        state["last_metrics"] = None
+        state["legacy_contract"] = True
+        return metadata, state
+    required_v2 = {"next_record", "schedule", "optimizer_step", "last_metrics"}
+    if not required_v2 <= state.keys():
+        missing = sorted(required_v2 - state.keys())
+        raise ValueError(f"pretraining checkpoint is missing state fields: {missing}")
     return metadata, state
 
 
-def _validate_resume_cursor(metadata, state, plan, args):
+def _validate_resume_cursor(metadata, state, train_size, args):
     """Validate checkpoint cursor and public metadata before loading weights."""
 
+    saved_batch_size = state["contract"].get("batch_size")
+    if not isinstance(saved_batch_size, int) or saved_batch_size < 1:
+        raise ValueError("pretraining checkpoint has invalid batch_size")
     cursor = TrainingCursor(
         epoch=state["epoch"],
+        next_record=state["next_record"],
         next_batch=state["next_batch"],
         global_update=state["global_update"],
     )
-    if not 0 <= cursor.epoch < args.epochs or not 0 <= cursor.next_batch <= plan.batches_per_epoch:
+    if not 0 <= cursor.epoch < args.epochs or not 0 <= cursor.next_record <= train_size:
         raise ValueError("invalid pretraining resume cursor")
-    if (
-        cursor.next_batch != plan.batches_per_epoch
-        and cursor.next_batch % args.gradient_accumulation_steps
-    ):
-        raise ValueError("pretraining cursor must be at an optimizer-update boundary")
-    expected_update = cursor.epoch * plan.updates_per_epoch + math.ceil(
-        cursor.next_batch / args.gradient_accumulation_steps
-    )
-    if cursor.global_update != expected_update:
-        raise ValueError("pretraining global_update and cursor disagree")
+    saved_expected_batch = math.ceil(cursor.next_record / saved_batch_size)
+    if cursor.next_batch != saved_expected_batch:
+        raise ValueError("pretraining cursor record and batch positions disagree")
+    if cursor.global_update < 0:
+        raise ValueError("pretraining global_update cannot be negative")
     if (
         metadata.get("epoch") != cursor.epoch
         or metadata.get("step") != cursor.global_update
-        or metadata.get("epoch_complete") != (cursor.next_batch == plan.batches_per_epoch)
+        or metadata.get("epoch_complete") != (cursor.next_record == train_size)
     ):
         raise ValueError("pretraining checkpoint metadata and resume cursor disagree")
+    cursor.next_batch = math.ceil(cursor.next_record / args.batch_size)
     return cursor
 
 
@@ -729,6 +800,8 @@ class PackedPretrainTrainer:
             args.tokenizer_path, trust_remote_code=True
         )
         self.model_config = build_model_config(args.model_config, self.tokenizer)
+        if args.gradient_checkpointing is not None:
+            self.model_config.gradient_checkpointing = args.gradient_checkpointing
         if self.device.type == "cuda" and (
             self.model_config.attention_backend != "flash_attn_4"
             or self.model_config.linear_attn_backend != "fla"
@@ -749,6 +822,11 @@ class PackedPretrainTrainer:
             len(self.train_dataset), args.batch_size, args.seed
         )
         self.plan = build_training_plan(args, len(self.batch_sampler))
+        self.schedule = {
+            "total_updates": self.plan.total_updates,
+            "warmup_updates": self.plan.warmup_updates,
+            "base_learning_rate": args.learning_rate,
+        }
         self.contract = build_training_contract(
             args,
             self.model_config,
@@ -762,24 +840,34 @@ class PackedPretrainTrainer:
 
         self.cursor = TrainingCursor()
         self.resume_state = None
+        self.last_metrics = None
+        self.current_learning_rate = args.learning_rate
         self.wandb_run_id = None
         checkpoint_metadata = None
         if args.resume_from:
             checkpoint_metadata, self.resume_state = _load_resume_state(args.resume_from)
-            if checkpoint_metadata.get("config") != self.resume_state.get("contract", {}).get("config"):
+            if _resume_config_signature(checkpoint_metadata.get("config", {})) != _resume_config_signature(
+                self.resume_state.get("contract", {}).get("config", {})
+            ):
                 raise ValueError("pretraining checkpoint config and resume contract disagree")
-            if self.resume_state.get("contract") != self.contract:
+            if _resume_contract_signature(self.resume_state.get("contract", {})) != _resume_contract_signature(self.contract):
                 changed = [
                     key
                     for key in self.contract
-                    if self.resume_state.get("contract", {}).get(key) != self.contract[key]
+                    if key not in MUTABLE_RESUME_KEYS
+                    and _resume_contract_signature(self.resume_state.get("contract", {})).get(key)
+                    != _resume_contract_signature(self.contract).get(key)
                 ]
                 raise ValueError(
                     f"pretraining resume contract mismatch: {changed}; math/config/data/tokenizer/backend/runtime must agree"
                 )
             self.cursor = _validate_resume_cursor(
-                checkpoint_metadata, self.resume_state, self.plan, args
+                checkpoint_metadata, self.resume_state, len(self.train_dataset), args
             )
+            self.schedule = dict(self.resume_state["schedule"])
+            if self.schedule["base_learning_rate"] != self.contract["learning_rate"]:
+                raise ValueError("pretraining checkpoint schedule and learning_rate disagree")
+            self.last_metrics = self.resume_state["last_metrics"]
             self.model.load_state_dict(extract_model_state(checkpoint_metadata), strict=True)
             self.wandb_run_id = checkpoint_metadata.get("wandb_run_id")
             if args.wandb_run_id and args.wandb_run_id != self.wandb_run_id:
@@ -802,6 +890,11 @@ class PackedPretrainTrainer:
         if checkpoint_metadata is not None:
             self.optimizer.load_state_dict(checkpoint_metadata["optimizer"])
             self.scaler.load_state_dict(checkpoint_metadata["scaler"])
+            self.current_learning_rate = float(
+                self.resume_state["optimizer_step"]["learning_rate"]
+            )
+            for group in self.optimizer.param_groups:
+                group["lr"] = self.current_learning_rate
 
         self.train_loader, self.validation_loader = _seeded_loaders(
             args,
@@ -834,12 +927,25 @@ class PackedPretrainTrainer:
         """Atomically save the exact cursor and runtime state."""
 
         path = destination or self.output_dir / f"mindlm_pretrain_{self.args.model_config}_latest.pt"
+        checkpoint_metrics = None
+        if self.last_metrics is not None:
+            checkpoint_metrics = {
+                key: value
+                for key, value in self.last_metrics.items()
+                if key not in {"tokens_per_second", "peak_allocated_gib", "peak_reserved_gib"}
+            }
         state = {
             "version": CHECKPOINT_STATE_VERSION,
             "epoch": self.cursor.epoch,
+            "next_record": self.cursor.next_record,
             "next_batch": self.cursor.next_batch,
             "global_update": self.cursor.global_update,
             "contract": self.contract,
+            "schedule": dict(self.schedule),
+            "optimizer_step": {
+                "learning_rate": self.current_learning_rate,
+            },
+            "last_metrics": checkpoint_metrics,
             "rng": capture_rng_state(self.device),
         }
         save_training_checkpoint(
@@ -850,7 +956,7 @@ class PackedPretrainTrainer:
             self.model_config,
             self.cursor.epoch,
             self.cursor.global_update,
-            self.cursor.next_batch == self.plan.batches_per_epoch,
+            self.cursor.next_record == len(self.train_dataset),
             training_stage="pretrain",
             wandb_run_id=self.wandb_run_id,
             extra_state={CHECKPOINT_STATE_KEY: state},
@@ -888,15 +994,16 @@ class PackedPretrainTrainer:
         )
         lr = learning_rate_at(
             self.cursor.global_update,
-            self.plan.total_updates,
-            self.plan.warmup_updates,
-            self.args.learning_rate,
+            self.schedule["total_updates"],
+            self.schedule["warmup_updates"],
+            self.schedule["base_learning_rate"],
         )
         for group in self.optimizer.param_groups:
             group["lr"] = lr
         self.scaler.step(self.optimizer)
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
+        self.current_learning_rate = lr
         self.cursor.global_update += 1
         return float(grad_norm), lr
 
@@ -929,19 +1036,20 @@ class PackedPretrainTrainer:
         stopped = False
         for epoch in range(self.cursor.epoch, self.args.epochs):
             self.batch_sampler.set_epoch(epoch)
-            self.batch_sampler.start_batch = (
-                self.cursor.next_batch if epoch == self.cursor.epoch else 0
-            )
+            start_record = self.cursor.next_record if epoch == self.cursor.epoch else 0
+            self.batch_sampler.set_start_record(start_record)
             self.cursor.epoch = epoch
-            self.cursor.next_batch = self.batch_sampler.start_batch
+            self.cursor.next_record = start_record
+            self.cursor.next_batch = math.ceil(start_record / self.args.batch_size)
+            records_consumed = start_record
             pending_batches = supervised_tokens = padded_tokens = 0
             window_loss = 0.0
             window_start = time.monotonic()
 
-            for batch_number, batch in enumerate(
-                self.train_loader, self.batch_sampler.start_batch + 1
-            ):
+            for local_batch_number, batch in enumerate(self.train_loader, 1):
                 input_ids, targets, loss_mask = batch
+                records_consumed += input_ids.size(0)
+                batch_number = math.ceil(records_consumed / self.args.batch_size)
                 batch_tokens = int(loss_mask.sum().item())
                 if batch_tokens == 0:
                     raise ValueError("training batch has no supervised tokens")
@@ -971,7 +1079,7 @@ class PackedPretrainTrainer:
                 pending_batches += 1
                 del loss_sum, input_ids, targets, loss_mask
 
-                is_epoch_end = batch_number == self.plan.batches_per_epoch
+                is_epoch_end = records_consumed == len(self.train_dataset)
                 if (
                     pending_batches != self.args.gradient_accumulation_steps
                     and not is_epoch_end
@@ -979,7 +1087,8 @@ class PackedPretrainTrainer:
                     continue
 
                 grad_norm, lr = self._optimizer_update(supervised_tokens)
-                self.cursor.next_batch = batch_number
+                self.cursor.next_record = records_consumed
+                self.cursor.next_batch = math.ceil(records_consumed / self.args.batch_size)
                 epoch_complete = is_epoch_end
                 stopped = bool(
                     self.args.limit_updates
@@ -1008,6 +1117,7 @@ class PackedPretrainTrainer:
                             self.args.loss_chunk_tokens,
                         )
                     )
+                self.last_metrics = metrics
                 if self.cursor.global_update % self.args.log_interval == 0 or eval_due:
                     print(
                         "PRETRAIN_METRICS " + json.dumps(metrics, sort_keys=True),
@@ -1039,11 +1149,11 @@ class PackedPretrainTrainer:
         self.save_progress()
         status = (
             "paused"
-            if stopped and self.cursor.global_update < self.plan.total_updates
+            if stopped and self.cursor.global_update < self.schedule["total_updates"]
             else "complete"
         )
         print(
-            f"Pretrain {status} update={self.cursor.global_update}/{self.plan.total_updates}",
+            f"Pretrain {status} update={self.cursor.global_update}/{self.schedule['total_updates']}",
             flush=True,
         )
         if self.wandb is not None:
