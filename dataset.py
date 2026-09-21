@@ -47,7 +47,7 @@ class PretrainDataset(Dataset):
 class PackedPretrainDataset(Dataset):
     """Memory-map fixed-length, Qwen3 chat-EOS-delimited token blocks.
 
-    ``prepare_pretrain_data.py`` writes ``<prefix>.bin`` and ``<prefix>.json``.
+    ``prepare_data.py --type pretrain`` writes ``<prefix>.bin`` and ``<prefix>.json``.
     Every stored record has ``max_length + 1`` real tokens, so this dataset avoids
     padding and its loss mask is always one. It is intended for pretraining only;
     answer-only SFT masking remains in ``SFTDataset``.

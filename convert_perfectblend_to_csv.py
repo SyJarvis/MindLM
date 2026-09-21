@@ -2,8 +2,8 @@
 
 Each multi-turn conversation is rendered with the Qwen3 chat-template markers
 (`<|im_start|>role\\n...<|im_end|>\\n`) so the pretraining run sees properly
-delimited dialogue. The result is consumed by prepare_pretrain_data.py, which
-tokenizes with add_special_tokens=False and inserts EOS between documents.
+delimited dialogue. The result is consumed by prepare_data.py --type pretrain,
+which tokenizes with add_special_tokens=False and inserts EOS between documents.
 """
 
 import argparse

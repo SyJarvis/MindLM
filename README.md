@@ -173,7 +173,6 @@ modeling_mindlm.py      Model, hybrid attention, and generation implementation
 dataset.py              Pretraining and answer-only SFT datasets
 training_utils.py       Shared config, loss, sampler, and checkpoint helpers
 prepare_data.py           Canonical train/heldout data preparation entry point
-prepare_pretrain_data.py  Single-stream Qwen3 chat-EOS packing utility
 bench_train_step.py     Synthetic train-step benchmark and profiler entry point
 pretrain.py             Pretraining entry point
 full_sft.py             Full SFT entry point
