@@ -123,10 +123,10 @@ def normalize_ultra(record: dict, max_tools: int = 0) -> dict | None:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokenizer", default=f"{REPO}/qwen3_tokenizer")
-    parser.add_argument("--max_tokens", type=int, default=3600)
+    parser.add_argument("--max_tokens", type=int, default=4096)
     parser.add_argument("--tool_limit", type=int, default=60000)
     parser.add_argument("--zh_limit", type=int, default=20000)
-    parser.add_argument("--max_tools", type=int, default=10,
+    parser.add_argument("--max_tools", type=int, default=8,
                         help="cap per-row tool schemas before rendering; called functions always kept; 0 = no cap")
     parser.add_argument("--output", default=f"{REPO}/data/sft_qwen3_combined.csv")
     args = parser.parse_args()
