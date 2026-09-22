@@ -29,6 +29,45 @@ def zh_ratio(text: str) -> float:
     return han / max(len(text), 1)
 
 
+def called_function_names(record: dict) -> set:
+    names = set()
+    for m in record.get("messages", []):
+        if m.get("role") != "assistant":
+            continue
+        for call in m.get("tool_calls") or []:
+            fn = call.get("function") or {}
+            if fn.get("name"):
+                names.add(fn["name"])
+    return names
+
+
+def cap_tools(tools: list, called: set, max_tools: int) -> list:
+    """Cap a row's schema list before rendering, keeping it self-consistent.
+
+    Called functions are always kept (dropping one would make a supervised
+    ``<tool_call>`` reference an undefined tool); remaining slots are filled
+    with the row's own schemas in their original order so the distractor set
+    stays domain-coherent. Rows whose called set alone exceeds the cap are
+    passed through unchanged rather than corrupted.
+    """
+    if max_tools <= 0 or not tools or len(tools) <= max_tools:
+        return tools
+    kept, seen = [], set()
+    for tool in tools:
+        name = (tool.get("function") or {}).get("name")
+        if name in called and name not in seen:
+            kept.append(tool)
+            seen.add(name)
+    for tool in tools:
+        if len(kept) >= max_tools:
+            break
+        name = (tool.get("function") or {}).get("name")
+        if name not in seen:
+            kept.append(tool)
+            seen.add(name)
+    return kept
+
+
 def legacy_rows(df: pd.DataFrame) -> list:
     rows = []
     for sample in df.itertuples(index=False):
@@ -48,7 +87,7 @@ def legacy_rows(df: pd.DataFrame) -> list:
     return rows
 
 
-def normalize_ultra(record: dict) -> dict | None:
+def normalize_ultra(record: dict, max_tools: int = 0) -> dict | None:
     """Map an UltraData record onto OpenAI message conventions for the qwen3 template.
 
     E2: the record's ``tools`` schema list is preserved in a dedicated CSV
@@ -76,6 +115,7 @@ def normalize_ultra(record: dict) -> dict | None:
         tools = None
     row = {"messages": json.dumps(messages, ensure_ascii=False), "source": "ultra"}
     if tools:
+        tools = cap_tools(tools, called_function_names(record), max_tools)
         row["tools"] = json.dumps(tools, ensure_ascii=False)
     return row
 
@@ -86,6 +126,8 @@ def main():
     parser.add_argument("--max_tokens", type=int, default=3600)
     parser.add_argument("--tool_limit", type=int, default=60000)
     parser.add_argument("--zh_limit", type=int, default=20000)
+    parser.add_argument("--max_tools", type=int, default=10,
+                        help="cap per-row tool schemas before rendering; called functions always kept; 0 = no cap")
     parser.add_argument("--output", default=f"{REPO}/data/sft_qwen3_combined.csv")
     args = parser.parse_args()
 
@@ -118,13 +160,13 @@ def main():
                 )
                 # zh candidate: chinese-dominant query, any subset
                 if len(zh_rows) < args.zh_limit and zh_ratio(user_text[:300]) > 0.3:
-                    row = normalize_ultra(record)
+                    row = normalize_ultra(record, args.max_tools)
                     if row:
                         zh_rows.append(row)
                 # tool candidate: must contain assistant tool_calls
                 if is_tool_file and len(tool_rows) < args.tool_limit:
                     if any(m.get("role") == "assistant" and m.get("tool_calls") for m in record.get("messages", [])):
-                        row = normalize_ultra(record)
+                        row = normalize_ultra(record, args.max_tools)
                         if row:
                             tool_rows.append(row)
         print(f"scanned {path}: tool={len(tool_rows)} zh={len(zh_rows)}")

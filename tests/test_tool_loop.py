@@ -15,6 +15,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "eval"))
 sys.path.insert(0, str(PROJECT_ROOT / "data_process"))
 
 from data_process.sft import assistant_sup_intervals, parse_tools, render_row
+from prepare_sft_qwen3 import called_function_names, cap_tools
 from eval.eval_sft_tool import parse_calls
 from eval.eval_sft_tool_loop import CASES, execute_call, run_case
 
@@ -225,3 +226,47 @@ class ClosedLoopTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CapToolsTest(unittest.TestCase):
+    """--max_tools capping invariants (prepare_sft_qwen3.cap_tools)."""
+
+    @staticmethod
+    def tool(name):
+        return {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
+
+    def record_with_calls(self, names):
+        return {"role": "assistant",
+                "tool_calls": [{"function": {"name": n, "arguments": "{}"}} for n in names]}
+
+    def test_called_functions_survive_the_cap(self):
+        tools = [self.tool(f"f{i}") for i in range(15)]
+        record = {"messages": [self.record_with_calls(["f12", "f3"])], "tools": tools}
+        capped = cap_tools(tools, called_function_names(record), 10)
+        names = [t["function"]["name"] for t in capped]
+        self.assertEqual(len(capped), 10)
+        self.assertIn("f12", names)
+        self.assertIn("f3", names)
+
+    def test_called_first_order(self):
+        tools = [self.tool(f"f{i}") for i in range(15)]
+        record = {"messages": [self.record_with_calls(["f9"])], "tools": tools}
+        names = [t["function"]["name"] for t in cap_tools(tools, called_function_names(record), 10)]
+        self.assertEqual(names[0], "f9")
+
+    def test_no_calls_keeps_original_order(self):
+        tools = [self.tool(f"f{i}") for i in range(15)]
+        self.assertEqual([t["function"]["name"] for t in cap_tools(tools, set(), 10)],
+                         [f"f{i}" for i in range(10)])
+
+    def test_under_limit_and_disabled_cap_are_noops(self):
+        tools = [self.tool(f"f{i}") for i in range(5)]
+        self.assertEqual(cap_tools(tools, {"f1"}, 10), tools)
+        tools15 = [self.tool(f"f{i}") for i in range(15)]
+        self.assertEqual(cap_tools(tools15, set(), 0), tools15)
+
+    def test_called_set_exceeding_cap_passes_through(self):
+        called_names = [f"c{i}" for i in range(12)]
+        tools = [self.tool(n) for n in called_names]
+        record = {"messages": [self.record_with_calls(called_names)], "tools": tools}
+        self.assertEqual(len(cap_tools(tools, called_function_names(record), 10)), 12)
