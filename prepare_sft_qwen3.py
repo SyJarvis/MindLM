@@ -49,7 +49,12 @@ def legacy_rows(df: pd.DataFrame) -> list:
 
 
 def normalize_ultra(record: dict) -> dict | None:
-    """Map an UltraData record onto OpenAI message conventions for the qwen3 template."""
+    """Map an UltraData record onto OpenAI message conventions for the qwen3 template.
+
+    E2: the record's ``tools`` schema list is preserved in a dedicated CSV
+    column so the bin renderer can pass it through ``apply_chat_template(tools=...)``
+    — the same rendering path used by serving and the tool eval probes.
+    """
     messages = []
     for m in record.get("messages", []):
         role = m.get("role")
@@ -64,12 +69,15 @@ def normalize_ultra(record: dict) -> dict | None:
             messages.append({"role": "assistant", "content": m.get("content") or "", "tool_calls": calls})
         elif role in ("user", "system", "tool") and m.get("content"):
             messages.append({"role": role, "content": m["content"]})
-    if not any(m.get("tool_calls") for m in messages if m["role"] == "assistant"):
-        if not messages:
-            return None
     if not any(m["role"] == "assistant" for m in messages):
         return None
-    return {"messages": json.dumps(messages, ensure_ascii=False), "source": "ultra"}
+    tools = record.get("tools")
+    if not isinstance(tools, list) or not tools:
+        tools = None
+    row = {"messages": json.dumps(messages, ensure_ascii=False), "source": "ultra"}
+    if tools:
+        row["tools"] = json.dumps(tools, ensure_ascii=False)
+    return row
 
 
 def main():
@@ -121,11 +129,16 @@ def main():
                             tool_rows.append(row)
         print(f"scanned {path}: tool={len(tool_rows)} zh={len(zh_rows)}")
 
-    # 3) length filter for ultra rows with the real tokenizer (rendered length)
+    # 3) length filter for ultra rows with the real tokenizer (rendered length).
+    # E2: render WITH the row's tools schema — the <tools> block adds tokens, so
+    # filtering must happen after it exists (docs/sft.md §2 requirement 1).
     def keep_short(row):
         messages = json.loads(row["messages"])
+        tools = json.loads(row["tools"]) if row.get("tools") else None
         try:
-            rendered = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            rendered = tok.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False, tools=tools,
+            )
         except Exception:
             return False
         return len(tok(rendered, add_special_tokens=False).input_ids) <= args.max_tokens
