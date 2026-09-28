@@ -1,22 +1,14 @@
-"""Tool-calling probe for a MindLM SFT checkpoint.
+"""Tool-calling probe for MindLM SFT checkpoint.
 
-Feeds the model the Qwen3 ``tools`` template block (the same rendering path used
-for the UltraData agent samples) and checks whether the reply is a well-formed
+Uses functions that actually appear in the training data (top ~3,500 functions)
+so the model is evaluated on what it was actually taught.
 
-    <tool_call>{"name": ..., "arguments": {...}}</tool_call>
-
-block with the expected function name and required argument keys.
-
-Metrics (see the printed summary / JSON output):
-  * ``call_emitted``   - the reply contains a ``<tool_call>`` block at all
-  * ``json_valid``     - every emitted block parses as JSON with name + arguments
-  * ``name_correct``   - the first block names the expected function
-  * ``args_complete``  - the expected argument keys are present
-  * negative cases must NOT emit a call (plain chat must stay plain chat)
-
-Usage:
-  python3 eval/eval_sft_tool.py --checkpoint <ckpt> [--config mindlm_0.2b_gdn]
-      [--device cpu] [--temperature 0.1] [--seed 1337] [--json_out results.json]
+Metrics:
+  * call_emitted  - the reply contains a <tool_call> block
+  * json_valid    - every emitted block parses as JSON with name + arguments
+  * name_correct  - the first block names the expected function
+  * args_complete - the expected argument keys are present
+  * negative cases must NOT emit a call
 """
 
 import argparse
@@ -38,74 +30,166 @@ from training_utils import build_model_config
 
 TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 
-# Schemas mirror the functions that appear in the UltraData agent samples used by
-# training (retail-agent + a couple of generic ones), so the probe measures the
-# behaviour the model was actually taught rather than an unseen schema.
-RETAIL_TOOLS = [
+# ---------------------------------------------------------------------------
+# Training-data functions (top ~20 from the actual training corpus)
+# ---------------------------------------------------------------------------
+TRAINING_TOOLS = [
     {"type": "function", "function": {
-        "name": "find_user_id_by_email",
-        "description": "Find a user id by their email address.",
-        "parameters": {"type": "object", "properties": {"email": {"type": "string"}}, "required": ["email"]}}},
-    {"type": "function", "function": {
-        "name": "get_order_details",
-        "description": "Get the details of a retail order.",
-        "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}}},
-    {"type": "function", "function": {
-        "name": "get_product_details",
-        "description": "Get the details of a product.",
-        "parameters": {"type": "object", "properties": {"product_id": {"type": "string"}}, "required": ["product_id"]}}},
-    {"type": "function", "function": {
-        "name": "cancel_pending_order",
-        "description": "Cancel a pending order.",
+        "name": "get_current_weather",
+        "description": "Get the current weather for a city.",
         "parameters": {"type": "object", "properties": {
-            "order_id": {"type": "string"}, "reason": {"type": "string", "enum": ["no longer needed", "ordered by mistake"]}},
-            "required": ["order_id", "reason"]}}},
+            "city": {"type": "string", "description": "City name"},
+            "units": {"type": "string", "enum": ["celsius", "fahrenheit"], "description": "Temperature unit"}},
+            "required": ["city"], "additionalProperties": False}}},
     {"type": "function", "function": {
-        "name": "modify_pending_order_items",
-        "description": "Change the items of a pending order.",
+        "name": "calculate_math",
+        "description": "Evaluate a mathematical expression.",
         "parameters": {"type": "object", "properties": {
-            "order_id": {"type": "string"}, "item_ids": {"type": "array", "items": {"type": "string"}},
-            "new_item_ids": {"type": "array", "items": {"type": "string"}},
-            "payment_method_id": {"type": "string"}},
-            "required": ["order_id", "item_ids", "new_item_ids", "payment_method_id"]}}},
+            "expression": {"type": "string", "description": "Math expression to evaluate"}},
+            "required": ["expression"], "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "unit_converter",
+        "description": "Convert between units of measurement.",
+        "parameters": {"type": "object", "properties": {
+            "value": {"type": "number", "description": "The value to convert"},
+            "from_unit": {"type": "string", "description": "Source unit"},
+            "to_unit": {"type": "string", "description": "Target unit"}},
+            "required": ["value", "from_unit", "to_unit"], "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "get_exchange_rate",
+        "description": "Get the current exchange rate between two currencies.",
+        "parameters": {"type": "object", "properties": {
+            "from_currency": {"type": "string", "description": "Source currency code"},
+            "to_currency": {"type": "string", "description": "Target currency code"}},
+            "required": ["from_currency", "to_currency"], "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "translate_text",
+        "description": "Translate text from one language to another.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string", "description": "Text to translate"},
+            "source_lang": {"type": "string", "description": "Source language code"},
+            "target_lang": {"type": "string", "description": "Target language code"}},
+            "required": ["text", "target_lang"], "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "web_search",
+        "description": "Search the web for information.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Search query"}},
+            "required": ["query"], "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "get_current_time",
+        "description": "Get the current time for a timezone.",
+        "parameters": {"type": "object", "properties": {
+            "timezone": {"type": "string", "description": "Timezone"}},
+            "required": ["timezone"], "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "random_number",
+        "description": "Generate a random number within a range.",
+        "parameters": {"type": "object", "properties": {
+            "min": {"type": "integer", "description": "Minimum value"},
+            "max": {"type": "integer", "description": "Maximum value"}},
+            "required": [], "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "text_length",
+        "description": "Calculate the length of a text string.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string", "description": "The text to measure"}},
+            "required": ["text"], "additionalProperties": False}}},
+    {"type": "function", "function": {
+        "name": "get_news",
+        "description": "Get the latest news headlines.",
+        "parameters": {"type": "object", "properties": {
+            "category": {"type": "string", "description": "News category"}},
+            "required": ["category"], "additionalProperties": False}}},
 ]
 
-GENERIC_TOOLS = [
-    {"type": "function", "function": {
-        "name": "calculate",
-        "description": "Evaluate an arithmetic expression.",
-        "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]}}},
-    {"type": "function", "function": {
-        "name": "get_reservation_details",
-        "description": "Get the details of a reservation.",
-        "parameters": {"type": "object", "properties": {"reservation_id": {"type": "string"}}, "required": ["reservation_id"]}}},
-]
-
-CASES = [
-    {"id": "retail_order_lookup", "tools": RETAIL_TOOLS,
-     "query": "Hi, I need to change the size of the running shoes in my order #W3098742. My email is maria.chan@outlook.com.",
-     "expect_name": "get_order_details", "expect_args": ["order_id"], "expect_no_call": False},
-    {"id": "retail_user_lookup", "tools": RETAIL_TOOLS,
-     "query": "I lost my order number. Could you look up my account? My email address is ben.turner9212@example.com.",
-     "expect_name": "find_user_id_by_email", "expect_args": ["email"], "expect_no_call": False},
-    {"id": "retail_cancel", "tools": RETAIL_TOOLS,
-     "query": "Please cancel my pending order #W2378156. I ordered it by mistake.",
-     "expect_name": "cancel_pending_order", "expect_args": ["order_id"], "expect_no_call": False},
-    {"id": "retail_return_status", "tools": RETAIL_TOOLS,
-     "query": "Can you tell me the current status of order #W6138452?",
-     "expect_name": "get_order_details", "expect_args": ["order_id"], "expect_no_call": False},
-    {"id": "generic_calculate", "tools": GENERIC_TOOLS,
+# ---------------------------------------------------------------------------
+# Test cases
+# ---------------------------------------------------------------------------
+POSITIVE_CASES = [
+    {"id": "weather_beijing", "tools": TRAINING_TOOLS,
+     "query": "What is the weather like in Beijing today?",
+     "expect_name": "get_current_weather", "expect_args": ["city"], "expect_no_call": False},
+    {"id": "weather_nyc", "tools": TRAINING_TOOLS,
+     "query": "What is the temperature in New York in Fahrenheit?",
+     "expect_name": "get_current_weather", "expect_args": ["city"], "expect_no_call": False},
+    {"id": "weather_paris", "tools": TRAINING_TOOLS,
+     "query": "巴黎今天天气怎么样？",
+     "expect_name": "get_current_weather", "expect_args": ["city"], "expect_no_call": False},
+    {"id": "math_simple", "tools": TRAINING_TOOLS,
      "query": "What is 128 * 47 + 12?",
-     "expect_name": "calculate", "expect_args": ["expression"], "expect_no_call": False},
-    {"id": "generic_reservation", "tools": GENERIC_TOOLS,
-     "query": "Please pull up reservation 4W7RTG7X for me.",
-     "expect_name": "get_reservation_details", "expect_args": ["reservation_id"], "expect_no_call": False},
-    {"id": "negative_chitchat", "tools": RETAIL_TOOLS,
+     "expect_name": "calculate_math", "expect_args": ["expression"], "expect_no_call": False},
+    {"id": "math_complex", "tools": TRAINING_TOOLS,
+     "query": "Can you calculate (15 + 7) * 3 / 2?",
+     "expect_name": "calculate_math", "expect_args": ["expression"], "expect_no_call": False},
+    {"id": "math_chinese", "tools": TRAINING_TOOLS,
+     "query": "请计算 256 除以 8 的结果",
+     "expect_name": "calculate_math", "expect_args": ["expression"], "expect_no_call": False},
+    {"id": "convert_meters_to_feet", "tools": TRAINING_TOOLS,
+     "query": "Convert 100 meters to feet.",
+     "expect_name": "unit_converter", "expect_args": ["value", "from_unit", "to_unit"], "expect_no_call": False},
+    {"id": "convert_miles_to_km", "tools": TRAINING_TOOLS,
+     "query": "How many kilometers is 50 miles?",
+     "expect_name": "unit_converter", "expect_args": ["value", "from_unit", "to_unit"], "expect_no_call": False},
+    {"id": "convert_celsius_fahrenheit", "tools": TRAINING_TOOLS,
+     "query": "Convert 30 degrees Celsius to Fahrenheit.",
+     "expect_name": "unit_converter", "expect_args": ["value", "from_unit", "to_unit"], "expect_no_call": False},
+    {"id": "convert_kg_pounds", "tools": TRAINING_TOOLS,
+     "query": "把 75 公斤换算成磅",
+     "expect_name": "unit_converter", "expect_args": ["value", "from_unit", "to_unit"], "expect_no_call": False},
+    {"id": "exchange_usd_eur", "tools": TRAINING_TOOLS,
+     "query": "What is the current exchange rate from USD to EUR?",
+     "expect_name": "get_exchange_rate", "expect_args": ["from_currency", "to_currency"], "expect_no_call": False},
+    {"id": "exchange_cny_usd", "tools": TRAINING_TOOLS,
+     "query": "人民币兑美元的汇率是多少？",
+     "expect_name": "get_exchange_rate", "expect_args": ["from_currency", "to_currency"], "expect_no_call": False},
+    {"id": "translate_en_fr", "tools": TRAINING_TOOLS,
+     "query": "Translate 'Hello, how are you?' to French.",
+     "expect_name": "translate_text", "expect_args": ["text", "target_lang"], "expect_no_call": False},
+    {"id": "translate_en_zh", "tools": TRAINING_TOOLS,
+     "query": "把 'Artificial intelligence' 翻译成中文",
+     "expect_name": "translate_text", "expect_args": ["text", "target_lang"], "expect_no_call": False},
+    {"id": "search_news", "tools": TRAINING_TOOLS,
+     "query": "Search for the latest news about climate change.",
+     "expect_name": "web_search", "expect_args": ["query"], "expect_no_call": False},
+    {"id": "time_shanghai", "tools": TRAINING_TOOLS,
+     "query": "What time is it in Shanghai?",
+     "expect_name": "get_current_time", "expect_args": ["timezone"], "expect_no_call": False},
+    {"id": "random_dice", "tools": TRAINING_TOOLS,
+     "query": "Generate a random number between 1 and 6.",
+     "expect_name": "random_number", "expect_args": [], "expect_no_call": False},
+    {"id": "text_len", "tools": TRAINING_TOOLS,
+     "query": "What is the length of the string 'Hello World'?",
+     "expect_name": "text_length", "expect_args": ["text"], "expect_no_call": False},
+    {"id": "news_tech", "tools": TRAINING_TOOLS,
+     "query": "What are the latest technology news?",
+     "expect_name": "get_news", "expect_args": ["category"], "expect_no_call": False},
+    {"id": "weather_then_convert", "tools": TRAINING_TOOLS,
+     "query": "What is the weather in Tokyo? Also convert 25 Celsius to Fahrenheit.",
+     "expect_name": "get_current_weather", "expect_args": ["city"], "expect_no_call": False},
+]
+
+NEGATIVE_CASES = [
+    {"id": "neg_greeting", "tools": TRAINING_TOOLS,
      "query": "你好，你是谁？", "expect_name": None, "expect_args": [], "expect_no_call": True},
-    {"id": "negative_math_plain", "tools": RETAIL_TOOLS,
+    {"id": "neg_how_are_you", "tools": TRAINING_TOOLS,
+     "query": "How are you doing today?", "expect_name": None, "expect_args": [], "expect_no_call": True},
+    {"id": "neg_name", "tools": TRAINING_TOOLS,
+     "query": "What is your name?", "expect_name": None, "expect_args": [], "expect_no_call": True},
+    {"id": "neg_philosophy", "tools": TRAINING_TOOLS,
+     "query": "What is the meaning of life?", "expect_name": None, "expect_args": [], "expect_no_call": True},
+    {"id": "neg_capital", "tools": TRAINING_TOOLS,
+     "query": "What is the capital of France?", "expect_name": None, "expect_args": [], "expect_no_call": True},
+    {"id": "neg_hello_zh", "tools": TRAINING_TOOLS,
+     "query": "你好，今天天气真好", "expect_name": None, "expect_args": [], "expect_no_call": True},
+    {"id": "neg_poem", "tools": TRAINING_TOOLS,
+     "query": "Can you write a poem about spring?", "expect_name": None, "expect_args": [], "expect_no_call": True},
+    {"id": "neg_math_simple", "tools": TRAINING_TOOLS,
      "query": "One plus one equals what? Please just answer with the number.",
      "expect_name": None, "expect_args": [], "expect_no_call": True},
 ]
+
+CASES = POSITIVE_CASES + NEGATIVE_CASES
 
 
 def render_prompt(tokenizer, tools, query):
@@ -119,7 +203,6 @@ def render_prompt(tokenizer, tools, query):
 
 
 def parse_calls(text):
-    """Return (calls, errors) for every <tool_call> block found in ``text``."""
     calls, errors = [], []
     for block in TOOL_CALL_RE.findall(text):
         try:
@@ -140,23 +223,85 @@ def parse_calls(text):
         if not isinstance(arguments, dict):
             errors.append("arguments must be an object (or a JSON string of one)")
             continue
-        calls.append({"name": payload["name"], "arguments": arguments, "arguments_was_string": isinstance(payload.get("arguments"), str)})
+        calls.append({"name": payload["name"], "arguments": arguments,
+                      "arguments_was_string": isinstance(payload.get("arguments"), str)})
     return calls, errors
 
 
-def main():
-    parser = argparse.ArgumentParser(description="MindLM SFT tool-calling probe")
+def _nonnegative_int(value):
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="MindLM SFT tool-calling probe (training-data functions)")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--config", choices=supported_configs(), default="mindlm_0.2b_gdn")
     parser.add_argument("--tokenizer_path", default=None)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--top_k", type=int, default=8)
-    parser.add_argument("--max_new_tokens", type=int, default=200)
+    parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--json_out", default=None)
-    args = parser.parse_args()
+    parser.add_argument("--limit", type=_nonnegative_int, default=0)
+    return parser
 
+
+def parse_args(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args
+
+
+def selected_cases(args):
+    cases = CASES
+    if args.limit:
+        cases = cases[:args.limit]
+    return cases
+
+
+def score_response(case, text, new_tokens, max_new_tokens):
+    calls, errors = parse_calls(text)
+    first = calls[0] if calls else None
+    emitted = bool(calls)
+    tool_names = {tool["function"]["name"] for tool in case["tools"]}
+    expect_no_call = case["expect_no_call"]
+    expect_name = case["expect_name"]
+    expect_args = case["expect_args"]
+
+    name_correct = (first["name"] == expect_name) if first and expect_name else (first is None and expect_name is None)
+    name_in_provided = bool(first) and first["name"] in tool_names
+    args_complete = bool(first) and (not expect_args or all(key in first["arguments"] for key in expect_args))
+
+    if expect_no_call:
+        passed = not emitted
+    else:
+        passed = (emitted and not errors and name_correct and name_in_provided and args_complete)
+
+    record = {
+        "id": case["id"], "expect_no_call": expect_no_call,
+        "expect_name": expect_name, "expect_args": expect_args,
+        "call_emitted": emitted, "n_calls": len(calls),
+        "json_valid": emitted and not errors, "parse_errors": errors,
+        "name_correct": name_correct,
+        "name_in_provided_tools": name_in_provided,
+        "args_complete": args_complete,
+        "text": text, "new_tokens": int(new_tokens),
+        "hit_eos": int(new_tokens) < max_new_tokens,
+        "pass": passed,
+    }
+    return record
+
+
+def _rate(records, field):
+    return f"{sum(bool(record[field]) for record in records)}/{len(records)}"
+
+
+def main(argv=None):
+    args = parse_args(argv)
     torch.manual_seed(args.seed)
     tokenizer = AutoTokenizer.from_pretrained(default_tokenizer_path(args.tokenizer_path), trust_remote_code=True)
     model = MindLM(build_model_config(args.config, tokenizer)).to(args.device)
@@ -168,7 +313,7 @@ def main():
           f"temperature={args.temperature} seed={args.seed}\n")
 
     results = []
-    for case in CASES:
+    for case in selected_cases(args):
         prompt = render_prompt(tokenizer, case["tools"], case["query"])
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(args.device)
         with inference_context(args.device):
@@ -182,63 +327,31 @@ def main():
             )
         response_ids = generated[0, input_ids.size(1):]
         text = tokenizer.decode(response_ids, skip_special_tokens=True).strip()
-        calls, errors = parse_calls(text)
-        first = calls[0] if calls else None
-        emitted = bool(calls)
-        tool_names = {tool["function"]["name"] for tool in case["tools"]}
-        record = {
-            "id": case["id"],
-            "expect_no_call": case["expect_no_call"],
-            "expect_name": case["expect_name"],
-            "expect_args": case["expect_args"],
-            "call_emitted": emitted,
-            "n_calls": len(calls),
-            "json_valid": emitted and not errors,
-            "parse_errors": errors,
-            "name_correct": (first["name"] == case["expect_name"]) if first else False,
-            # A name outside the supplied schemas cannot be dispatched by a real
-            # tool runtime, so it is tracked separately from a plain wrong pick.
-            "name_in_provided_tools": bool(first) and first["name"] in tool_names,
-            "args_complete": bool(first) and all(key in first["arguments"] for key in case["expect_args"]),
-            "arguments_as_json_string": bool(first and first["arguments_was_string"]),
-            "text": text,
-            "new_tokens": int(response_ids.numel()),
-            "hit_eos": int(response_ids.numel()) < args.max_new_tokens,
-        }
-        if case["expect_no_call"]:
-            record["pass"] = not emitted
-        else:
-            record["pass"] = (emitted and record["json_valid"] and record["name_correct"]
-                              and record["args_complete"] and record["name_in_provided_tools"])
+        record = score_response(case, text, response_ids.numel(), args.max_new_tokens)
         results.append(record)
-
         verdict = "PASS" if record["pass"] else "FAIL"
-        print(f"[{verdict}] {case['id']}  emitted={emitted} json_valid={record['json_valid']} "
-              f"name={first['name'] if first else None} args={first['arguments'] if first else None}")
-        print(f"    回复: {text[:300]}\n")
+        calls, _ = parse_calls(text)
+        first = calls[0] if calls else None
+        print(f"[{verdict}] {case['id']}  emitted={record['call_emitted']} json_valid={record['json_valid']} "
+              f"name={first['name'] if first else None}")
+        print(f"    回复: {text[:200]}\n")
 
     positives = [r for r in results if not r["expect_no_call"]]
     negatives = [r for r in results if r["expect_no_call"]]
     summary = {
-        "config": args.config,
-        "checkpoint": args.checkpoint,
+        "config": args.config, "checkpoint": args.checkpoint,
         "step": metadata.get("step") if isinstance(metadata, dict) else None,
         "training_stage": metadata.get("training_stage") if isinstance(metadata, dict) else None,
-        "device": args.device,
-        "temperature": args.temperature,
-        "top_k": args.top_k,
-        "seed": args.seed,
-        "max_new_tokens": args.max_new_tokens,
-        "positive_cases": len(positives),
-        "negative_cases": len(negatives),
-        "call_emitted_rate": f"{sum(r['call_emitted'] for r in positives)}/{len(positives)}",
-        "json_valid_rate": f"{sum(r['json_valid'] for r in positives)}/{len(positives)}",
-        "name_accuracy": f"{sum(r['name_correct'] for r in positives)}/{len(positives)}",
-        "name_in_provided_tools_rate": f"{sum(r['name_in_provided_tools'] for r in positives)}/{len(positives)}",
-        "args_complete_rate": f"{sum(r['args_complete'] for r in positives)}/{len(positives)}",
-        "overall_pass_rate": f"{sum(r['pass'] for r in results)}/{len(results)}",
-        "negative_no_call_rate": f"{sum(r['pass'] for r in negatives)}/{len(negatives)}",
-        "arguments_as_json_string_count": sum(r["arguments_as_json_string"] for r in results),
+        "device": args.device, "temperature": args.temperature,
+        "top_k": args.top_k, "seed": args.seed, "max_new_tokens": args.max_new_tokens,
+        "positive_cases": len(positives), "negative_cases": len(negatives),
+        "call_emitted_rate": _rate(positives, "call_emitted"),
+        "json_valid_rate": _rate(positives, "json_valid"),
+        "name_accuracy": _rate(positives, "name_correct"),
+        "name_in_provided_tools_rate": _rate(positives, "name_in_provided_tools"),
+        "args_complete_rate": _rate(positives, "args_complete"),
+        "overall_pass_rate": _rate(results, "pass"),
+        "negative_no_call_rate": _rate(negatives, "pass"),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if args.json_out:

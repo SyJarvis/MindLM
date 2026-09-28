@@ -31,19 +31,26 @@ def render_row(tok, messages, tools=None):
     return text, ids
 
 
-def parse_tools(raw):
-    """Decode the CSV ``tools`` cell. Returns a schema list or None.
+class ToolsParseError(ValueError):
+    """A non-empty CSV tools cell is not a valid non-empty schema list."""
 
-    Empty cells and ``[]`` both mean "no tools"; malformed JSON also returns
-    None so the row degrades to the plain rendering path instead of being lost.
+
+def parse_tools(raw):
+    """Decode the CSV ``tools`` cell into a non-empty schema list or None.
+
+    Only an empty or whitespace-only cell means "no tools". Any other invalid
+    value raises ``ToolsParseError`` so callers cannot silently render it as a
+    tools-free row.
     """
     if not raw or not str(raw).strip():
         return None
     try:
         value = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    return value or None
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ToolsParseError("tools must be valid JSON") from exc
+    if not isinstance(value, list) or not value:
+        raise ToolsParseError("tools must decode to a non-empty list")
+    return value
 
 
 def assistant_sup_intervals(ids, assistant_ids, im_end_ids, keep):
@@ -99,7 +106,11 @@ def main(argv=None):
             stats["total"] += 1
             if stats["total"] % args.progress_every == 0:
                 print(f"... {stats['total']} rows, over_long={stats['over_long']}", flush=True)
-            tools = parse_tools(row.get("tools"))
+            try:
+                tools = parse_tools(row.get("tools"))
+            except ToolsParseError:
+                stats["tools_parse_errors"] += 1
+                continue
             if tools:
                 stats["rows_with_tools"] += 1
             try:
@@ -122,10 +133,10 @@ def main(argv=None):
             if tools:
                 stats["tools_block_rendered"] += 1
 
-            keep = min(len(ids), args.max_tokens)
             if len(ids) > args.max_tokens:
                 stats["over_long"] += 1
-
+                continue
+            keep = len(ids)
             sup = assistant_sup_intervals(ids, assistant_ids, im_end_ids, keep)
             if not sup:
                 stats["errors"] += 1
@@ -147,11 +158,11 @@ def main(argv=None):
     n = len(lengths)
     stats.update({
         "kept": n,
-        "mean_len": round(sum(lengths) / n, 1),
-        "p50": lengths[n // 2],
-        "p90": lengths[int(n * 0.9)],
-        "p99": lengths[int(n * 0.99)],
-        "max": lengths[-1],
+        "mean_len": round(sum(lengths) / n, 1) if n else 0,
+        "p50": lengths[n // 2] if n else 0,
+        "p90": lengths[int(n * 0.9)] if n else 0,
+        "p99": lengths[int(n * 0.99)] if n else 0,
+        "max": lengths[-1] if n else 0,
         "le_256": sum(l <= 256 for l in lengths),
         "le_512": sum(256 < l <= 512 for l in lengths),
         "le_1024": sum(512 < l <= 1024 for l in lengths),
