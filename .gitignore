@@ -10,3 +10,4 @@ logs/
 data/
 scripts/__pycache__/
 runs/
+full_data_v2/
