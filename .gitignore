@@ -9,3 +9,4 @@ out_pretrain_minimind_pb/
 logs/
 data/
 scripts/__pycache__/
+runs/
