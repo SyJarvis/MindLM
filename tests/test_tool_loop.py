@@ -64,6 +64,14 @@ class ToolsRenderTest(unittest.TestCase):
 
     def test_main_skips_overlong_and_invalid_tools_rows(self):
         class FakeTokenizer:
+            # Minimal stub for the main() path: vocabulary contains the qwen3
+            # turn-end token and a far-away UNK id (never inside short header ids).
+            VOCAB = {"<|im_end|>": 151645}
+            unk_token_id = 999
+
+            def get_vocab(self):
+                return dict(self.VOCAB)
+
             def apply_chat_template(self, messages, **kwargs):
                 return "rendered row is deliberately overlong"
 
@@ -148,6 +156,47 @@ class ToolsRenderTest(unittest.TestCase):
         text_old = self.tok.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False, enable_thinking=False)
         self.assertEqual(text_new, text_old)
+
+    def test_mindlm_template_style_renders_and_supervises(self):
+        """Stage-D mainline: mindlm_tokenizer template + </s> turn end supervision."""
+        from data_process.sft import TEMPLATE_STYLES
+        from transformers import AutoTokenizer
+        mtok = AutoTokenizer.from_pretrained(
+            str(PROJECT_ROOT / "tokenizers" / "mindlm_tokenizer"), trust_remote_code=True)
+        style = TEMPLATE_STYLES["mindlm"]
+        messages = [
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "你好！有什么可以帮你？"},
+            {"role": "user", "content": "1+1=?"},
+            {"role": "assistant", "content": "2"},
+        ]
+        text, ids = render_row(mtok, messages, None, style)
+        self.assertIn("<s>assistant\n你好！有什么可以帮你？</s>", text)
+        self.assertIn("<s>assistant\n2</s>", text)
+        self.assertNotIn("enable_thinking", text)
+        header_ids = mtok(style["assistant_header"], add_special_tokens=False).input_ids
+        end_ids = mtok(style["turn_end"], add_special_tokens=False).input_ids
+        sup = assistant_sup_intervals(ids, header_ids, end_ids, len(ids))
+        self.assertEqual(len(sup), 2, "two assistant turns must be supervised")
+        for start, length in sup:
+            span_ids = ids[start + 1:start + 1 + length]
+            self.assertEqual(span_ids[-1], end_ids[0], "span must end with </s>")
+        decoded = [mtok.decode(ids[s + 1:s + 1 + l]) for s, l in sup]
+        self.assertIn("你好！有什么可以帮你？", decoded[0])
+        self.assertIn("2", decoded[1])
+
+    def test_mindlm_style_downgrades_tool_rows(self):
+        """mindlm template has no tools section: schema rows train tools-free."""
+        from data_process.sft import TEMPLATE_STYLES
+        from transformers import AutoTokenizer
+        mtok = AutoTokenizer.from_pretrained(
+            str(PROJECT_ROOT / "tokenizers" / "mindlm_tokenizer"), trust_remote_code=True)
+        style = TEMPLATE_STYLES["mindlm"]
+        # Qwen-style tool_calls rows: rendering must not raise and must not
+        # attempt a tools block; the mindlm template just ignores the schema.
+        text, ids = render_row(mtok, TOOL_MESSAGES, TOOL_SCHEMA, style)
+        self.assertNotIn("<tools>", text)
+        self.assertIn("<s>assistant", text)
 
 
 class ClosedLoopTest(unittest.TestCase):
