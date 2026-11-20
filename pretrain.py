@@ -132,6 +132,14 @@ def parse_args(argv=None):
     )
     parser.add_argument("--tokenizer_path", default=None)
     parser.add_argument(
+        "--boundary_token",
+        default=None,
+        help=(
+            "Document boundary token used by packed data. Defaults to <|im_end|> "
+            "(legacy Qwen3 contract); mindlm_tokenizer uses </s>."
+        ),
+    )
+    parser.add_argument(
         "--model_config",
         choices=("mindlm_0.2b_gdn",),
         default="mindlm_0.2b_gdn",
@@ -337,21 +345,35 @@ def fingerprint_data(dataset):
     }
 
 
-def chat_eos_id(tokenizer):
-    """Resolve the explicit Qwen3 chat boundary token."""
+def resolve_boundary_token(tokenizer, requested=None):
+    """Resolve the document boundary token from the tokenizer.
 
+    Defaults to the legacy Qwen3 chat EOS; tokenizers without it must pass an
+    explicit boundary token (mindlm_tokenizer uses ``</s>``).
+    """
     convert = getattr(tokenizer, "convert_tokens_to_ids", None)
     if not callable(convert):
         raise ValueError("tokenizer must expose convert_tokens_to_ids")
     vocabulary = tokenizer.get_vocab()
-    if CHAT_EOS_TOKEN not in vocabulary:
-        raise ValueError(f"tokenizer does not contain {CHAT_EOS_TOKEN}")
-    token_id = convert(CHAT_EOS_TOKEN)
+    token = requested or CHAT_EOS_TOKEN
+    if token not in vocabulary:
+        raise ValueError(
+            f"tokenizer does not contain boundary token {token!r}; "
+            "pass --boundary_token explicitly"
+        )
+    token_id = convert(token)
     if token_id is None or isinstance(token_id, (list, tuple)):
-        raise ValueError(f"tokenizer does not contain {CHAT_EOS_TOKEN}")
+        raise ValueError(f"tokenizer does not contain boundary token {token!r}")
     token_id = int(token_id)
     if not 0 <= token_id < len(tokenizer):
-        raise ValueError(f"invalid {CHAT_EOS_TOKEN} id: {token_id}")
+        raise ValueError(f"invalid {token!r} id: {token_id}")
+    return token, token_id
+
+
+def chat_eos_id(tokenizer):
+    """Return the legacy Qwen3 chat EOS id (kept for compatibility)."""
+
+    _, token_id = resolve_boundary_token(tokenizer)
     return token_id
 
 
@@ -624,11 +646,14 @@ def build_training_contract(
             "num_workers",
         )
     }
+    boundary_token, boundary_token_id = resolve_boundary_token(
+        tokenizer, getattr(args, "boundary_token", None)
+    )
     contract.update(
         data_format={
             "format": PackedPretrainDataset.FORMAT,
-            "boundary_token": CHAT_EOS_TOKEN,
-            "boundary_token_id": chat_eos_id(tokenizer),
+            "boundary_token": boundary_token,
+            "boundary_token_id": boundary_token_id,
             "token_dtype": "uint32",
             "loss_mask_dtype": "uint8",
         },
@@ -809,15 +834,20 @@ class PackedPretrainTrainer:
             raise ValueError("CUDA pretraining requires flash_attn_4 and fla backends")
 
         self.model = MindLM(self.model_config)
+        boundary_token, boundary_token_id = resolve_boundary_token(
+            self.tokenizer, getattr(args, "boundary_token", None)
+        )
+        self.boundary_token = boundary_token
         self.train_dataset = PackedPretrainDataset(
-            self.train_prefix, self.model_config.max_seq_len, len(self.tokenizer)
+            self.train_prefix, self.model_config.max_seq_len, len(self.tokenizer),
+            boundary_token=self.boundary_token,
         )
         self.validation_dataset = PackedPretrainDataset(
-            self.validation_prefix, self.model_config.max_seq_len, len(self.tokenizer)
+            self.validation_prefix, self.model_config.max_seq_len, len(self.tokenizer),
+            boundary_token=self.boundary_token,
         )
-        expected_chat_eos_id = chat_eos_id(self.tokenizer)
-        validate_dataset_boundary(self.train_dataset, expected_chat_eos_id)
-        validate_dataset_boundary(self.validation_dataset, expected_chat_eos_id)
+        validate_dataset_boundary(self.train_dataset, boundary_token_id)
+        validate_dataset_boundary(self.validation_dataset, boundary_token_id)
         self.batch_sampler = ResumableBatchSampler(
             len(self.train_dataset), args.batch_size, args.seed
         )

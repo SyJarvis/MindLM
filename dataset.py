@@ -56,8 +56,11 @@ class PackedPretrainDataset(Dataset):
     FORMAT = "mindlm_packed_pretrain_v1"
     BOUNDARY_TOKEN = "<|im_end|>"
 
-    def __init__(self, prefix, max_length, tokenizer_vocab_size=None):
+    def __init__(self, prefix, max_length, tokenizer_vocab_size=None, boundary_token=None):
         super().__init__()
+        # Boundary token defaults to the legacy Qwen3 chat EOS; the streaming
+        # mainline (mindlm_tokenizer) passes its own EOS (</s>).
+        self.boundary_token = boundary_token or self.BOUNDARY_TOKEN
         prefix = Path(prefix)
         self.tokens_path = prefix.with_suffix(".bin")
         metadata_path = prefix.with_suffix(".json")
@@ -75,10 +78,10 @@ class PackedPretrainDataset(Dataset):
                 f"Packed sequence length is {metadata.get('sequence_length')}, "
                 f"but the model requires {max_length}."
             )
-        if metadata.get("boundary_token") != self.BOUNDARY_TOKEN:
+        if metadata.get("boundary_token") != self.boundary_token:
             raise ValueError(
-                "Packed dataset must use the Qwen3 chat EOS boundary "
-                f"{self.BOUNDARY_TOKEN!r}"
+                "Packed dataset boundary token mismatch: expected "
+                f"{self.boundary_token!r}, found {metadata.get('boundary_token')!r}"
             )
         boundary_token_id = metadata.get("boundary_token_id")
         if (
