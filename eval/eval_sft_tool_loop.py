@@ -302,7 +302,7 @@ def _run_corpus_case(generate_fn, tokenizer, case, max_rounds, max_new_tokens):
         prompt = render_messages(tokenizer, messages, case["tools"])
         text, new_tokens, hit_eos = generate_fn(prompt)
         rounds.append({"round": round_index + 1, "new_tokens": new_tokens, "hit_eos": hit_eos})
-        calls, errors = parse_calls(text)
+        calls, errors = parse_calls(text, strict=True)
         parse_errors.extend(errors)
         if not calls:
             final_text, final_hit_eos = text, hit_eos
@@ -338,7 +338,8 @@ def _run_corpus_case(generate_fn, tokenizer, case, max_rounds, max_new_tokens):
     first = actual_calls[0] if actual_calls else None
     expected_names = {tool["function"]["name"] for tool in case["tools"]}
     observed_results = [item["result"] for item in trace]
-    final_answer_emitted = final_text is not None and not parse_calls(final_text)[0]
+    final_calls, final_errors = parse_calls(final_text or "", strict=True)
+    final_answer_emitted = final_text is not None and not final_calls and not final_errors
     final_relevant = final_oracle_match(
         final_text or "", case["expect"]["final_answer"]["oracle"], case["fixture"])
     violations = must_not_claim_violations(final_text or "", case["expect"]["must_not_claim"])

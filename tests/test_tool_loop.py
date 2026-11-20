@@ -477,6 +477,30 @@ class V1EvaluatorTest(unittest.TestCase):
                 self.assertEqual(record["recovery_outcome"], "recovered")
                 self.assertFalse(record["fabricated_success"])
 
+    def test_v1_rejects_incomplete_and_malformed_call_tags(self):
+        negative = self.case("negative")
+        answer = self.oracle_answer(negative)
+        single = self.case("single_positive", 1)
+        valid_call = self.tool_call(single["expect"]["calls"][0])
+        for suffix in ("<tool_call>{", "<tool_call", "</tool_call>",
+                       '<tool_call >{"name":"calculate","arguments":{}}</tool_call>'):
+            with self.subTest(suffix=suffix):
+                text = answer + suffix
+                record = score_response(negative, text, len(text), 256)
+                self.assertFalse(record["pass"], record)
+                self.assertTrue(record["parse_errors"])
+                loop = run_case(self.scripted([text]), self.tok, negative, 2, 256)
+                self.assertFalse(loop["pass"], loop)
+                self.assertTrue(loop["parse_errors"])
+                self.assertFalse(loop["final_answer_emitted"])
+                positive = score_response(single, valid_call + suffix, 10, 256)
+                self.assertFalse(positive["pass"], positive)
+                self.assertTrue(positive["parse_errors"])
+
+        # The original key-only legacy probe retains its historical parser behavior.
+        legacy = next(case for case in SINGLE_CASES if case["expect_no_call"])
+        self.assertTrue(score_response(legacy, "2<tool_call>{", 10, 256)["pass"])
+
     def test_v1_loop_typical_failures_and_runtime_errors(self):
         case = self.case("loop_closure", 1)
         call = case["expect"]["calls"][0]
