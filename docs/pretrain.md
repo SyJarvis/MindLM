@@ -21,6 +21,14 @@
 
 数据资产目录由数据准备命令的 `--output-dir` 指定；train 与 heldout manifest 会记录各自的边界 token、词表和 SHA256。
 
+### 文档边界与生成停止
+
+Base pretraining 将 `<|im_end|>` 作为文档边界的 next-token target 训练，而不是 instruction-answer 的回答结束信号。数据准备在每篇文档末尾追加该 token；packed dataset 再以右移一位的 token 作为监督目标，因此模型学习的是“真实文档结束后，下一个 token 是 `<|im_end|>`”。
+
+生成时，当前实现仅在生成 `<|im_end|>`（`eos_token_id`）或达到上下文长度上限时提前停止；否则会生成满 `max_new_tokens`。因此，尚未训练充分的 base model 经常达到 `max_new_tokens`，不能据此判断 `<|im_end|>` 未参与训练。
+
+更有效的检查应从 heldout 文档截取真实边界前的文本作为输入，在最后一个位置检查 `<|im_end|>` 的 logit 排名或 softmax 概率；也可以从同一前缀生成，观察模型是否在真实文档结束处生成该 token。任意短提示上的停止率不是等价测试。
+
 ## 2. 模型配置
 
 配置文件：[`config/mindlm_0.2b_gdn.json`](../config/mindlm_0.2b_gdn.json)。

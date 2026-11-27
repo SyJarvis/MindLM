@@ -31,9 +31,9 @@
 
 | ID | 标记 | `special` | 用途 |
 | --- | --- | --- | --- |
-| 151643 | `<|endoftext|>` | true | `pad_token`；预训练文档结束 |
+| 151643 | `<|endoftext|>` | true | `pad_token`；不作为当前预训练文档边界 |
 | 151644 | `<|im_start|>` | true | ChatML 对话轮开始 |
-| 151645 | `<|im_end|>` | true | `eos_token`；对话轮结束 |
+| 151645 | `<|im_end|>` | true | `eos_token`；当前预训练文档边界、ChatML 对话轮结束 |
 
 ### 视觉 / 多模态（均属于 `additional_special_tokens`）
 

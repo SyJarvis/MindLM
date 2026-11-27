@@ -22,6 +22,7 @@ import argparse
 import json
 import re
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
@@ -32,8 +33,12 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from eval_common import default_tokenizer_path, inference_context, load_checkpoint_with_tokenizer_check, supported_configs
-from eval_sft_tool import GENERIC_TOOLS, RETAIL_TOOLS, parse_calls
+from eval_sft_tool import (GENERIC_TOOLS, RETAIL_TOOLS, _breakdown, _filter_values,
+                           _nonnegative_int, _rate, parse_calls)
 from modeling_mindlm import MindLM
+from tool_case_loader import CATEGORIES, load_cases
+from tool_runtime import (ToolCaseRuntime, args_exact_match, fabricated_success,
+                          final_oracle_match, must_not_claim_violations)
 from training_utils import build_model_config
 
 # ---------------------------------------------------------------------------
@@ -169,6 +174,9 @@ CASES = [
      "expect_no_call": True},
 ]
 
+LOOP_CASE_SUITES = frozenset({"loop_closure", "error_recovery", "negative"})
+DEFAULT_LOOP_CASE_SUITES = ("loop_closure", "error_recovery", "negative")
+
 
 def render_messages(tokenizer, messages, tools):
     prompt = tokenizer.apply_chat_template(
@@ -189,7 +197,7 @@ def execute_call(call):
         return {"error": f"executor failed: {exc}"}
 
 
-def run_case(generate_fn, tokenizer, case, max_rounds, max_new_tokens):
+def _run_legacy_case(generate_fn, tokenizer, case, max_rounds, max_new_tokens):
     """Drive one closed-loop case.  ``generate_fn(prompt) -> (text, new_tokens, hit_eos)``.
 
     Pure w.r.t. the model: tests inject a scripted generate_fn, main() injects
@@ -272,7 +280,144 @@ def run_case(generate_fn, tokenizer, case, max_rounds, max_new_tokens):
     return record
 
 
-def main():
+def _mutable_json(value):
+    if isinstance(value, Mapping):
+        return {key: _mutable_json(child) for key, child in value.items()}
+    if isinstance(value, tuple):
+        return [_mutable_json(child) for child in value]
+    return value
+
+
+def _run_corpus_case(generate_fn, tokenizer, case, max_rounds, max_new_tokens):
+    expected_calls = case["expect"]["calls"]
+    expect_no_call = case["suite"] == "negative"
+    rounds_allowed = max(max_rounds, len(expected_calls) + 1)
+    runtime = ToolCaseRuntime(case)
+    messages = [{"role": "user", "content": case["query"]}]
+    rounds, trace, parse_errors, runtime_errors = [], [], [], []
+    final_text, final_hit_eos = None, False
+    exhausted = False
+
+    for round_index in range(rounds_allowed):
+        prompt = render_messages(tokenizer, messages, case["tools"])
+        text, new_tokens, hit_eos = generate_fn(prompt)
+        rounds.append({"round": round_index + 1, "new_tokens": new_tokens, "hit_eos": hit_eos})
+        calls, errors = parse_calls(text, strict=True)
+        parse_errors.extend(errors)
+        if not calls:
+            final_text, final_hit_eos = text, hit_eos
+            break
+        for call in calls:
+            step = len(trace) + 1
+            try:
+                result = _mutable_json(runtime.execute(call["name"], call["arguments"], step))
+                runtime_error = None
+            except (RuntimeError, TypeError, ValueError) as exc:
+                result = {"error": {"type": "runtime_error", "message": str(exc)}}
+                runtime_error = str(exc)
+                runtime_errors.append(runtime_error)
+            trace.append({"name": call["name"], "arguments": call["arguments"],
+                          "result": result, "runtime_error": runtime_error})
+            messages.append({"role": "assistant", "content": "",
+                             "tool_calls": [{"type": "function", "function": {
+                                 "name": call["name"],
+                                 "arguments": json.dumps(call["arguments"], ensure_ascii=False)}}]})
+            messages.append({"role": "tool", "content": json.dumps(result, ensure_ascii=False)})
+    else:
+        exhausted = True
+        final_text = text
+
+    actual_calls = [{"name": item["name"], "arguments": item["arguments"]} for item in trace]
+    call_sequence_correct = (len(actual_calls) == len(expected_calls)
+                             and all(actual["name"] == expected["name"]
+                                     for actual, expected in zip(actual_calls, expected_calls)))
+    args_value_match = (len(actual_calls) == len(expected_calls)
+                        and all(args_exact_match(actual["arguments"], expected["arguments"]["exact"])
+                                for actual, expected in zip(actual_calls, expected_calls)))
+    expected_first = expected_calls[0] if expected_calls else None
+    first = actual_calls[0] if actual_calls else None
+    expected_names = {tool["function"]["name"] for tool in case["tools"]}
+    observed_results = [item["result"] for item in trace]
+    final_calls, final_errors = parse_calls(final_text or "", strict=True)
+    final_answer_emitted = final_text is not None and not final_calls and not final_errors
+    final_relevant = final_oracle_match(
+        final_text or "", case["expect"]["final_answer"]["oracle"], case["fixture"])
+    violations = must_not_claim_violations(final_text or "", case["expect"]["must_not_claim"])
+    fabricated = fabricated_success(final_text or "", observed_results)
+    executed_ok = (bool(trace) and not runtime_errors
+                   and all("error" not in item["result"] for item in trace))
+    loop_stuck = exhausted
+    if case["suite"] == "error_recovery":
+        retry_exact = (len(actual_calls) == 2 and actual_calls[0]["name"] == actual_calls[1]["name"]
+                       and args_exact_match(actual_calls[0]["arguments"], actual_calls[1]["arguments"]))
+        first_failed = len(observed_results) >= 1 and "error" in observed_results[0]
+        retry_succeeded = len(observed_results) == 2 and "error" not in observed_results[1]
+        if runtime_errors:
+            recovery_outcome = "runtime_error"
+        elif not first_failed:
+            recovery_outcome = "missing_injected_error"
+        elif not retry_exact:
+            recovery_outcome = "incorrect_retry"
+        elif not retry_succeeded:
+            recovery_outcome = "retry_failed"
+        elif fabricated or violations:
+            recovery_outcome = "fabricated_or_forbidden_claim"
+        elif not final_relevant:
+            recovery_outcome = "final_oracle_failed"
+        else:
+            recovery_outcome = "recovered"
+    else:
+        retry_exact = False
+        recovery_outcome = None
+
+    record = {
+        "id": case["id"], "suite": case["suite"], "category": case["category"],
+        "expect_no_call": expect_no_call, "n_rounds": len(rounds), "n_calls": len(trace),
+        "called_names": [item["name"] for item in trace], "call_emitted": bool(trace),
+        "json_valid": bool(trace) and not parse_errors, "parse_errors": parse_errors,
+        "name_correct": bool(first and expected_first and first["name"] == expected_first["name"]),
+        "name_in_provided_tools": bool(first) and first["name"] in expected_names,
+        "args_complete": bool(first and expected_first) and all(
+            key in first["arguments"] for key in expected_first["arguments"]["required"]),
+        "args_value_match": args_value_match,
+        "call_sequence_correct": call_sequence_correct,
+        "tool_executed_ok": executed_ok,
+        "final_answer_emitted": final_answer_emitted,
+        "final_relevant": final_relevant, "final_hit_eos": final_hit_eos,
+        "final_text": (final_text or "")[:400], "loop_stuck": loop_stuck,
+        "trace": trace, "runtime_errors": runtime_errors,
+        "fabricated_success": fabricated, "must_not_claim_violations": violations,
+        "retry_exact": retry_exact, "recovery_outcome": recovery_outcome,
+    }
+    if expect_no_call:
+        record["pass"] = (not trace and not parse_errors and final_answer_emitted
+                          and final_relevant)
+    elif case["suite"] == "loop_closure":
+        record["pass"] = (not parse_errors and call_sequence_correct and args_value_match and executed_ok
+                          and final_answer_emitted and final_relevant and not loop_stuck)
+    else:
+        record["pass"] = (not parse_errors and call_sequence_correct and args_value_match and retry_exact
+                          and recovery_outcome == "recovered" and final_answer_emitted
+                          and not loop_stuck)
+    return record
+
+
+def run_case(generate_fn, tokenizer, case, max_rounds, max_new_tokens):
+    if "suite" in case:
+        return _run_corpus_case(generate_fn, tokenizer, case, max_rounds, max_new_tokens)
+    record = _run_legacy_case(generate_fn, tokenizer, case, max_rounds, max_new_tokens)
+    record.update(
+        args_value_match=record["args_complete"],
+        call_sequence_correct=(not record["call_emitted"] if record["expect_no_call"]
+                               else record["name_correct"]),
+        fabricated_success=False,
+        recovery_outcome=None,
+        runtime_errors=[],
+    )
+    return record
+
+
+def build_parser():
     parser = argparse.ArgumentParser(description="MindLM closed-loop tool-calling eval")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--config", choices=supported_configs(), default="mindlm_0.2b_gdn")
@@ -284,7 +429,73 @@ def main():
     parser.add_argument("--max_rounds", type=int, default=2)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--json_out", default=None)
-    args = parser.parse_args()
+    parser.add_argument("--cases", default=None, help="validated v1 JSONL case corpus")
+    parser.add_argument("--suite", action="append", help="suite filter; repeat or comma-separate")
+    parser.add_argument("--category", action="append", help="category filter; repeat or comma-separate")
+    parser.add_argument("--limit", type=_nonnegative_int, default=0)
+    return parser
+
+
+def parse_args(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.suite, args.category = _filter_values(args.suite), _filter_values(args.category)
+    if not args.cases:
+        if args.suite is not None or args.category is not None or args.limit:
+            parser.error("--suite, --category, and --limit require --cases")
+        return args
+    if args.suite is None:
+        args.suite = list(DEFAULT_LOOP_CASE_SUITES)
+    unknown_suites = set(args.suite) - LOOP_CASE_SUITES
+    if unknown_suites:
+        parser.error(f"unsupported suite for this evaluator: {sorted(unknown_suites)}")
+    if args.category is not None and set(args.category) - set(CATEGORIES):
+        parser.error(f"unknown category: {sorted(set(args.category) - set(CATEGORIES))}")
+    return args
+
+
+def selected_cases(args):
+    if not args.cases:
+        return CASES
+    return load_cases(args.cases, suites=args.suite, categories=args.category, limit=args.limit)
+
+
+def build_summary(args, results):
+    positives = [r for r in results if not r["expect_no_call"]]
+    negatives = [r for r in results if r["expect_no_call"]]
+    return {
+        "config": args.config,
+        "checkpoint": args.checkpoint,
+        "device": args.device,
+        "temperature": args.temperature,
+        "seed": args.seed,
+        "max_rounds": args.max_rounds,
+        "positive_cases": len(positives),
+        "negative_cases": len(negatives),
+        "first_call_name_accuracy": _rate(positives, "name_correct"),
+        "args_complete_rate": _rate(positives, "args_complete"),
+        "tool_executed_ok_rate": _rate(positives, "tool_executed_ok"),
+        "final_answer_emitted_rate": _rate(positives, "final_answer_emitted"),
+        "final_relevant_rate": _rate(positives, "final_relevant"),
+        "loop_pass_rate": _rate(positives, "pass"),
+        "negative_pass_rate": _rate(negatives, "pass"),
+        "loop_stuck_count": sum(r["loop_stuck"] for r in results),
+        "overall_pass_rate": _rate(results, "pass"),
+        "args_value_match_rate": _rate(positives, "args_value_match"),
+        "call_sequence_correct_rate": _rate(results, "call_sequence_correct"),
+        "fabricated_success_count": sum(r["fabricated_success"] for r in results),
+        "recovery_outcomes": {
+            outcome: sum(r["recovery_outcome"] == outcome for r in results)
+            for outcome in sorted({r["recovery_outcome"] for r in results
+                                   if r["recovery_outcome"] is not None})
+        },
+        "by_suite": _breakdown(results, "suite"),
+        "by_category": _breakdown(results, "category"),
+    }
+
+
+def main(argv=None):
+    args = parse_args(argv)
 
     torch.manual_seed(args.seed)
     tokenizer = AutoTokenizer.from_pretrained(default_tokenizer_path(args.tokenizer_path), trust_remote_code=True)
@@ -312,7 +523,7 @@ def main():
 
     reset_runtime_state()
     results = [run_case(generate_fn, tokenizer, case, args.max_rounds, args.max_new_tokens)
-               for case in CASES]
+               for case in selected_cases(args)]
     reset_runtime_state()
 
     for record in results:
@@ -321,27 +532,7 @@ def main():
               f"names={record['called_names']} final_relevant={record['final_relevant']}")
         print(f"    终答: {record['final_text'][:200]}\n")
 
-    positives = [r for r in results if not r["expect_no_call"]]
-    negatives = [r for r in results if r["expect_no_call"]]
-    summary = {
-        "config": args.config,
-        "checkpoint": args.checkpoint,
-        "device": args.device,
-        "temperature": args.temperature,
-        "seed": args.seed,
-        "max_rounds": args.max_rounds,
-        "positive_cases": len(positives),
-        "negative_cases": len(negatives),
-        "first_call_name_accuracy": f"{sum(r['name_correct'] for r in positives)}/{len(positives)}",
-        "args_complete_rate": f"{sum(r['args_complete'] for r in positives)}/{len(positives)}",
-        "tool_executed_ok_rate": f"{sum(r['tool_executed_ok'] for r in positives)}/{len(positives)}",
-        "final_answer_emitted_rate": f"{sum(r['final_answer_emitted'] for r in positives)}/{len(positives)}",
-        "final_relevant_rate": f"{sum(r['final_relevant'] for r in positives)}/{len(positives)}",
-        "loop_pass_rate": f"{sum(r['pass'] for r in positives)}/{len(positives)}",
-        "negative_pass_rate": f"{sum(r['pass'] for r in negatives)}/{len(negatives)}",
-        "loop_stuck_count": sum(r["loop_stuck"] for r in results),
-        "overall_pass_rate": f"{sum(r['pass'] for r in results)}/{len(results)}",
-    }
+    summary = build_summary(args, results)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if args.json_out:
         Path(args.json_out).write_text(

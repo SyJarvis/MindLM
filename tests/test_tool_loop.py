@@ -4,20 +4,30 @@ No model is built: the loop is driven by scripted ``generate_fn`` responses and
 the data-pipeline checks use the real Qwen3 tokenizer on synthetic rows.
 """
 
+import csv
+import io
 import json
 import sys
+import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "eval"))
 sys.path.insert(0, str(PROJECT_ROOT / "data_process"))
-
-from data_process.sft import assistant_sup_intervals, parse_tools, render_row
+from data_process.sft import (ToolsParseError, assistant_sup_intervals, main as sft_main,
+                              parse_tools, render_row)
 from prepare_sft_qwen3 import called_function_names, cap_tools
-from eval.eval_sft_tool import parse_calls
-from eval.eval_sft_tool_loop import CASES, execute_call, run_case
+from eval.eval_sft_tool import (CASES as SINGLE_CASES, build_summary as build_single_summary,
+                                parse_args as parse_single_args, parse_calls, score_response)
+from eval.eval_sft_tool_loop import (CASES, build_summary as build_loop_summary, execute_call,
+                                     parse_args as parse_loop_args, run_case)
+from eval.tool_case_loader import load_cases
+
+V1_CASES = PROJECT_ROOT / "eval" / "tool_cases_v1.jsonl"
 
 TOOL_SCHEMA = [
     {"type": "function", "function": {
@@ -42,12 +52,61 @@ class ToolsRenderTest(unittest.TestCase):
         cls.assistant_ids = cls.tok("<|im_start|>assistant\n", add_special_tokens=False).input_ids
         cls.im_end_ids = cls.tok("<|im_end|>", add_special_tokens=False).input_ids
 
-    def test_parse_tools_accepts_empty_and_rejects_garbage(self):
+    def test_parse_tools_only_accepts_empty_cells_or_nonempty_lists(self):
         self.assertIsNone(parse_tools(""))
+        self.assertIsNone(parse_tools("   \t"))
         self.assertIsNone(parse_tools(None))
-        self.assertIsNone(parse_tools("[]"))
-        self.assertIsNone(parse_tools("not json"))
+        for raw in ("[]", "not json", "{}", "null", '"string"'):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ToolsParseError):
+                    parse_tools(raw)
         self.assertEqual(parse_tools(json.dumps(TOOL_SCHEMA)), TOOL_SCHEMA)
+
+    def test_main_skips_overlong_and_invalid_tools_rows(self):
+        class FakeTokenizer:
+            # Minimal stub for the main() path: vocabulary contains the qwen3
+            # turn-end token and a far-away UNK id (never inside short header ids).
+            VOCAB = {"<|im_end|>": 151645}
+            unk_token_id = 999
+
+            def get_vocab(self):
+                return dict(self.VOCAB)
+
+            def apply_chat_template(self, messages, **kwargs):
+                return "rendered row is deliberately overlong"
+
+            def __call__(self, text, add_special_tokens=False):
+                return mock.Mock(input_ids=list(range(len(text))))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "input.csv"
+            bin_path = root / "tokens.bin"
+            meta_path = root / "rows.jsonl"
+            stats_path = root / "stats.json"
+            with csv_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["messages", "tools", "source"])
+                writer.writeheader()
+                writer.writerows([
+                    {"messages": "[]", "tools": "  ", "source": "overlong"},
+                ] + [
+                    {"messages": "[]", "tools": raw, "source": f"invalid-tools-{i}"}
+                    for i, raw in enumerate(("not json", "[]", "{}", "null", "\"string\""))
+                ])
+            argv = [
+                "--csv", str(csv_path), "--tokenizer", "unused", "--max_tokens", "4",
+                "--bin", str(bin_path), "--meta", str(meta_path), "--stats", str(stats_path),
+            ]
+            with mock.patch("data_process.sft.AutoTokenizer.from_pretrained", return_value=FakeTokenizer()):
+                with redirect_stdout(io.StringIO()):
+                    sft_main(argv)
+
+            stats = json.loads(stats_path.read_text())
+            self.assertEqual(stats["over_long"], 1)
+            self.assertEqual(stats["tools_parse_errors"], 5)
+            self.assertEqual(stats["kept"], 0)
+            self.assertEqual(bin_path.read_bytes(), b"")
+            self.assertEqual(meta_path.read_text(), "")
 
     def test_render_with_tools_emits_tools_block(self):
         text, ids = render_row(self.tok, TOOL_MESSAGES, TOOL_SCHEMA)
@@ -97,6 +156,47 @@ class ToolsRenderTest(unittest.TestCase):
         text_old = self.tok.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False, enable_thinking=False)
         self.assertEqual(text_new, text_old)
+
+    def test_mindlm_template_style_renders_and_supervises(self):
+        """Stage-D mainline: mindlm_tokenizer template + </s> turn end supervision."""
+        from data_process.sft import TEMPLATE_STYLES
+        from transformers import AutoTokenizer
+        mtok = AutoTokenizer.from_pretrained(
+            str(PROJECT_ROOT / "tokenizers" / "mindlm_tokenizer"), trust_remote_code=True)
+        style = TEMPLATE_STYLES["mindlm"]
+        messages = [
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "你好！有什么可以帮你？"},
+            {"role": "user", "content": "1+1=?"},
+            {"role": "assistant", "content": "2"},
+        ]
+        text, ids = render_row(mtok, messages, None, style)
+        self.assertIn("<s>assistant\n你好！有什么可以帮你？</s>", text)
+        self.assertIn("<s>assistant\n2</s>", text)
+        self.assertNotIn("enable_thinking", text)
+        header_ids = mtok(style["assistant_header"], add_special_tokens=False).input_ids
+        end_ids = mtok(style["turn_end"], add_special_tokens=False).input_ids
+        sup = assistant_sup_intervals(ids, header_ids, end_ids, len(ids))
+        self.assertEqual(len(sup), 2, "two assistant turns must be supervised")
+        for start, length in sup:
+            span_ids = ids[start + 1:start + 1 + length]
+            self.assertEqual(span_ids[-1], end_ids[0], "span must end with </s>")
+        decoded = [mtok.decode(ids[s + 1:s + 1 + l]) for s, l in sup]
+        self.assertIn("你好！有什么可以帮你？", decoded[0])
+        self.assertIn("2", decoded[1])
+
+    def test_mindlm_style_downgrades_tool_rows(self):
+        """mindlm template has no tools section: schema rows train tools-free."""
+        from data_process.sft import TEMPLATE_STYLES
+        from transformers import AutoTokenizer
+        mtok = AutoTokenizer.from_pretrained(
+            str(PROJECT_ROOT / "tokenizers" / "mindlm_tokenizer"), trust_remote_code=True)
+        style = TEMPLATE_STYLES["mindlm"]
+        # Qwen-style tool_calls rows: rendering must not raise and must not
+        # attempt a tools block; the mindlm template just ignores the schema.
+        text, ids = render_row(mtok, TOOL_MESSAGES, TOOL_SCHEMA, style)
+        self.assertNotIn("<tools>", text)
+        self.assertIn("<s>assistant", text)
 
 
 class ClosedLoopTest(unittest.TestCase):
@@ -270,3 +370,208 @@ class CapToolsTest(unittest.TestCase):
         tools = [self.tool(n) for n in called_names]
         record = {"messages": [self.record_with_calls(called_names)], "tools": tools}
         self.assertEqual(len(cap_tools(tools, called_function_names(record), 10)), 12)
+
+
+class EvalCaseSelectionTest(unittest.TestCase):
+    def test_repeatable_and_comma_filters_and_defaults(self):
+        single = parse_single_args([
+            "--checkpoint", "unused", "--cases", str(V1_CASES),
+            "--suite", "single_positive,negative", "--category", "product",
+            "--category", "calculation,reservation", "--limit", "7",
+        ])
+        self.assertEqual(single.suite, ["single_positive", "negative"])
+        self.assertEqual(single.category, ["product", "calculation", "reservation"])
+        self.assertEqual(single.limit, 7)
+        loop = parse_loop_args(["--checkpoint", "unused", "--cases", str(V1_CASES)])
+        self.assertEqual(loop.suite, ["loop_closure", "error_recovery", "negative"])
+
+    def test_suite_constraints_and_case_only_filters(self):
+        with redirect_stdout(io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_single_args(["--checkpoint", "unused", "--cases", str(V1_CASES),
+                                   "--suite", "loop_closure"])
+            with self.assertRaises(SystemExit):
+                parse_loop_args(["--checkpoint", "unused", "--cases", str(V1_CASES),
+                                 "--suite", "single_positive"])
+            with self.assertRaises(SystemExit):
+                parse_single_args(["--checkpoint", "unused", "--limit", "1"])
+
+
+class V1EvaluatorTest(unittest.TestCase):
+    class Tokenizer:
+        def apply_chat_template(self, messages, **kwargs):
+            return json.dumps(messages, ensure_ascii=False)
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cases = load_cases(V1_CASES)
+        cls.tok = cls.Tokenizer()
+
+    @classmethod
+    def case(cls, suite, min_calls=0):
+        return next(case for case in cls.cases
+                    if case["suite"] == suite and len(case["expect"]["calls"]) >= min_calls)
+
+    @staticmethod
+    def tool_call(call, arguments=None):
+        payload = {"name": call["name"],
+                   "arguments": call["arguments"]["exact"] if arguments is None else arguments}
+        return f"<tool_call>{json.dumps(payload, ensure_ascii=False)}</tool_call>"
+
+    @staticmethod
+    def oracle_answer(case):
+        oracle = case["expect"]["final_answer"]["oracle"]
+        if "required_any" in oracle:
+            return oracle["required_any"][0]
+        return "Result: " + "; ".join(str(fact["value"]) for fact in oracle["required_facts"])
+
+    @staticmethod
+    def scripted(responses):
+        queue = iter(responses)
+
+        def generate_fn(prompt):
+            text = next(queue)
+            return text, len(text), True
+        return generate_fn
+
+    def test_legacy_single_semantics_and_fields_are_retained(self):
+        case = next(case for case in SINGLE_CASES if case["id"] == "generic_calculate")
+        text = '<tool_call>{"name": "calculate", "arguments": {"expression": "wrong"}}</tool_call>'
+        record = score_response(case, text, 10, 200)
+        self.assertTrue(record["pass"], record)
+        legacy_fields = {"id", "expect_no_call", "expect_name", "expect_args", "call_emitted",
+                         "n_calls", "json_valid", "parse_errors", "name_correct",
+                         "name_in_provided_tools", "args_complete", "arguments_as_json_string",
+                         "text", "new_tokens", "hit_eos", "pass"}
+        self.assertLessEqual(legacy_fields, set(record))
+
+        single_args = parse_single_args(["--checkpoint", "unused"])
+        negative = score_response(SINGLE_CASES[-1], "2", 1, 200)
+        single_summary = build_single_summary(single_args, {}, [record, negative])
+        single_legacy = {
+            "config", "checkpoint", "step", "training_stage", "device", "temperature",
+            "top_k", "seed", "max_new_tokens", "positive_cases", "negative_cases",
+            "call_emitted_rate", "json_valid_rate", "name_accuracy",
+            "name_in_provided_tools_rate", "args_complete_rate", "overall_pass_rate",
+            "negative_no_call_rate", "arguments_as_json_string_count",
+        }
+        additions = {"args_value_match_rate", "call_sequence_correct_rate",
+                     "fabricated_success_count", "recovery_outcomes", "by_suite", "by_category"}
+        self.assertLessEqual(single_legacy | additions, set(single_summary))
+        self.assertEqual(single_summary["overall_pass_rate"], "2/2")
+
+        loop_case = next(case for case in CASES if case["id"] == "loop_neg_math")
+        loop_record = run_case(self.scripted(["2"]), self.tok, loop_case, 2, 256)
+        positive_case = next(case for case in CASES if case["id"] == "loop_calc")
+        positive_record = run_case(self.scripted([
+            '<tool_call>{"name": "calculate", "arguments": {"expression": "128*47+12"}}</tool_call>',
+            "6028",
+        ]), self.tok, positive_case, 2, 256)
+        loop_args = parse_loop_args(["--checkpoint", "unused"])
+        loop_summary = build_loop_summary(loop_args, [positive_record, loop_record])
+        loop_legacy = {
+            "config", "checkpoint", "device", "temperature", "seed", "max_rounds",
+            "positive_cases", "negative_cases", "first_call_name_accuracy",
+            "args_complete_rate", "tool_executed_ok_rate", "final_answer_emitted_rate",
+            "final_relevant_rate", "loop_pass_rate", "negative_pass_rate",
+            "loop_stuck_count", "overall_pass_rate",
+        }
+        self.assertLessEqual(loop_legacy | additions, set(loop_summary))
+        self.assertEqual(loop_summary["overall_pass_rate"], "2/2")
+
+    def test_v1_single_and_negative_strict_oracles(self):
+        single = self.case("single_positive", 1)
+        exact = score_response(single, self.tool_call(single["expect"]["calls"][0]), 10, 200)
+        self.assertTrue(exact["pass"], exact)
+        wrong_args = dict(single["expect"]["calls"][0]["arguments"]["exact"])
+        wrong_args["unexpected"] = True
+        wrong = score_response(single, self.tool_call(single["expect"]["calls"][0], wrong_args), 10, 200)
+        self.assertFalse(wrong["pass"])
+        self.assertFalse(wrong["args_value_match"])
+
+        negatives = [case for case in self.cases if case["suite"] == "negative"]
+        self.assertEqual(len(negatives), 50)
+        for negative in negatives:
+            answer = self.oracle_answer(negative)
+            oracle = negative["expect"]["final_answer"]["oracle"]
+            forbidden_answer = f"{oracle['required_any'][0]} {oracle['forbidden'][0]}"
+            with self.subTest(case=negative["id"], evaluator="single"):
+                self.assertTrue(score_response(negative, answer, len(answer), 200)["pass"])
+                self.assertFalse(score_response(negative, "unrelated direct answer", 4, 200)["pass"])
+                self.assertFalse(score_response(
+                    negative, forbidden_answer, len(forbidden_answer), 200)["pass"])
+                attempted = f"{answer}<tool_call>{{bad json}}</tool_call>"
+                self.assertFalse(score_response(negative, attempted, len(attempted), 200)["pass"])
+            with self.subTest(case=negative["id"], evaluator="loop"):
+                correct = run_case(self.scripted([answer]), self.tok, negative, 2, 256)
+                incorrect = run_case(self.scripted(["unrelated direct answer"]), self.tok, negative, 2, 256)
+                forbidden = run_case(self.scripted([forbidden_answer]), self.tok, negative, 2, 256)
+                self.assertTrue(correct["pass"], correct)
+                self.assertFalse(incorrect["pass"], incorrect)
+                self.assertFalse(forbidden["pass"], forbidden)
+                call = '<tool_call>{"name":"calculate","arguments":{"expression":"1+1"}}</tool_call>'
+                attempted = run_case(self.scripted([call, answer]), self.tok, negative, 2, 256)
+                self.assertFalse(attempted["pass"])
+
+    def test_v1_loop_and_error_recovery_pass(self):
+        for suite in ("loop_closure", "error_recovery"):
+            case = self.case(suite, 2 if suite == "error_recovery" else 1)
+            responses = [self.tool_call(call) for call in case["expect"]["calls"]]
+            responses.append(self.oracle_answer(case))
+            record = run_case(self.scripted(responses), self.tok, case, 2, 256)
+            self.assertTrue(record["pass"], record)
+            self.assertTrue(record["args_value_match"])
+            self.assertTrue(record["call_sequence_correct"])
+            if suite == "error_recovery":
+                self.assertEqual(record["recovery_outcome"], "recovered")
+                self.assertFalse(record["fabricated_success"])
+
+    def test_v1_rejects_incomplete_and_malformed_call_tags(self):
+        negative = self.case("negative")
+        answer = self.oracle_answer(negative)
+        single = self.case("single_positive", 1)
+        valid_call = self.tool_call(single["expect"]["calls"][0])
+        for suffix in ("<tool_call>{", "<tool_call", "</tool_call>",
+                       '<tool_call >{"name":"calculate","arguments":{}}</tool_call>'):
+            with self.subTest(suffix=suffix):
+                text = answer + suffix
+                record = score_response(negative, text, len(text), 256)
+                self.assertFalse(record["pass"], record)
+                self.assertTrue(record["parse_errors"])
+                loop = run_case(self.scripted([text]), self.tok, negative, 2, 256)
+                self.assertFalse(loop["pass"], loop)
+                self.assertTrue(loop["parse_errors"])
+                self.assertFalse(loop["final_answer_emitted"])
+                positive = score_response(single, valid_call + suffix, 10, 256)
+                self.assertFalse(positive["pass"], positive)
+                self.assertTrue(positive["parse_errors"])
+
+        # The original key-only legacy probe retains its historical parser behavior.
+        legacy = next(case for case in SINGLE_CASES if case["expect_no_call"])
+        self.assertTrue(score_response(legacy, "2<tool_call>{", 10, 256)["pass"])
+
+    def test_v1_loop_typical_failures_and_runtime_errors(self):
+        case = self.case("loop_closure", 1)
+        call = case["expect"]["calls"][0]
+        wrong_args = dict(call["arguments"]["exact"])
+        wrong_args[next(iter(wrong_args))] = "wrong-value"
+        runtime_failure = run_case(
+            self.scripted([self.tool_call(call, wrong_args), self.oracle_answer(case)]),
+            self.tok, case, 2, 256)
+        self.assertFalse(runtime_failure["pass"])
+        self.assertTrue(runtime_failure["runtime_errors"])
+
+        oracle_failure = run_case(
+            self.scripted([self.tool_call(expected) for expected in case["expect"]["calls"]] + ["invented"]),
+            self.tok, case, 2, 256)
+        self.assertFalse(oracle_failure["pass"])
+        self.assertFalse(oracle_failure["final_relevant"])
+
+        recovery = self.case("error_recovery", 2)
+        fabricated = run_case(
+            self.scripted([self.tool_call(recovery["expect"]["calls"][0]),
+                           "The operation succeeded before retry."]),
+            self.tok, recovery, 2, 256)
+        self.assertFalse(fabricated["pass"])
+        self.assertTrue(fabricated["fabricated_success"])
+        self.assertEqual(fabricated["recovery_outcome"], "incorrect_retry")

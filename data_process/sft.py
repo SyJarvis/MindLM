@@ -3,6 +3,16 @@
 E2: rows may carry a ``tools`` column (JSON array of OpenAI-style function
 schemas). It is passed to ``apply_chat_template`` so the training input renders
 the same ``<tools>`` block that serving and ``eval_sft_tool*.py`` produce.
+
+Template styles:
+- ``qwen3`` (legacy default): expects the Qwen3 tokenizer chat template with
+  ``<|im_start|>assistant`` headers, ``<|im_end|>`` turn ends, the
+  ``enable_thinking`` kwarg and template-level tools rendering.
+- ``mindlm`` (stage D mainline): the mindlm_tokenizer built-in template renders
+  ``<s>assistant`` headers and ``</s>`` turn ends, has no thinking toggle and
+  no tools section. Rows with tool schemas are downgraded to tools-free
+  rendering and counted in ``tools_unrendered``; the assistant XML body still
+  trains, only the schema block does not.
 """
 import argparse
 import csv
@@ -14,16 +24,36 @@ from transformers import AutoTokenizer
 
 REPO = str(Path(__file__).resolve().parents[1])
 
+TEMPLATE_STYLES = {
+    "qwen3": {
+        "assistant_header": "<|im_start|>assistant\n",
+        "turn_end": "<|im_end|>",
+        "pass_enable_thinking": True,
+        "supports_tools": True,
+    },
+    "mindlm": {
+        "assistant_header": "<s>assistant\n",
+        "turn_end": "</s>",
+        "pass_enable_thinking": False,
+        "supports_tools": False,
+    },
+}
 
-def render_row(tok, messages, tools=None):
-    """Apply the Qwen3 chat template exactly like the serving/eval path.
+
+def render_row(tok, messages, tools=None, style=None):
+    """Apply the tokenizer's chat template exactly like the serving/eval path.
 
     Returns ``(text, ids)``. ``tools`` must be a non-empty schema list or None;
     the Qwen3 template treats ``[]`` as "no tools".
     """
+    kwargs = {}
+    if style is None or style.get("pass_enable_thinking"):
+        kwargs["enable_thinking"] = False
+    if style is not None and not style.get("supports_tools"):
+        tools = None
     text = tok.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=False,
-        enable_thinking=False, tools=tools,
+        tools=tools, **kwargs,
     )
     if not isinstance(text, str):
         text = "".join(block.get("text", "") if isinstance(block, dict) else str(block) for block in text)
@@ -31,19 +61,26 @@ def render_row(tok, messages, tools=None):
     return text, ids
 
 
-def parse_tools(raw):
-    """Decode the CSV ``tools`` cell. Returns a schema list or None.
+class ToolsParseError(ValueError):
+    """A non-empty CSV tools cell is not a valid non-empty schema list."""
 
-    Empty cells and ``[]`` both mean "no tools"; malformed JSON also returns
-    None so the row degrades to the plain rendering path instead of being lost.
+
+def parse_tools(raw):
+    """Decode the CSV ``tools`` cell into a non-empty schema list or None.
+
+    Only an empty or whitespace-only cell means "no tools". Any other invalid
+    value raises ``ToolsParseError`` so callers cannot silently render it as a
+    tools-free row.
     """
     if not raw or not str(raw).strip():
         return None
     try:
         value = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    return value or None
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ToolsParseError("tools must be valid JSON") from exc
+    if not isinstance(value, list) or not value:
+        raise ToolsParseError("tools must decode to a non-empty list")
+    return value
 
 
 def assistant_sup_intervals(ids, assistant_ids, im_end_ids, keep):
@@ -76,6 +113,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--csv", default=f"{REPO}/data/sft_qwen3_combined.csv")
     parser.add_argument("--tokenizer", default=f"{REPO}/qwen3_tokenizer")
+    parser.add_argument("--template_style", choices=sorted(TEMPLATE_STYLES), default="qwen3",
+                        help="chat-template flavor: qwen3 legacy (default) or mindlm stage-D mainline")
     parser.add_argument("--max_tokens", type=int, default=4096)
     parser.add_argument("--bin", default=f"{REPO}/data/sft_tokens_4096.bin")
     parser.add_argument("--meta", default=f"{REPO}/data/sft_tokens_4096.rows.jsonl")
@@ -83,13 +122,30 @@ def main(argv=None):
     parser.add_argument("--progress_every", type=int, default=500000)
     args = parser.parse_args(argv)
 
+    style = dict(TEMPLATE_STYLES[args.template_style])
     tok = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+    # The turn end must be a single vocab token (</s> id=2 for mindlm,
+    # <|im_end|> id=151645 for qwen3); the assistant header is multi-token and
+    # only needs to tokenize without UNK.
+    if style["turn_end"] not in tok.get_vocab():
+        raise SystemExit(
+            f"tokenizer {args.tokenizer} has no turn-end token {style['turn_end']!r}; "
+            f"cannot use template_style {args.template_style!r}"
+        )
+    header_ids = tok(style["assistant_header"], add_special_tokens=False).input_ids
+    if not header_ids or tok.unk_token_id in header_ids:
+        raise SystemExit(
+            f"tokenizer {args.tokenizer} cannot encode the assistant header "
+            f"{style['assistant_header']!r}; cannot use template_style {args.template_style!r}"
+        )
     stats = {"total": 0, "errors": 0, "over_long": 0, "tokens": 0, "answer_tokens": 0,
-             "rows_with_tools": 0, "tools_block_rendered": 0, "tools_parse_errors": 0}
+             "rows_with_tools": 0, "tools_block_rendered": 0, "tools_parse_errors": 0,
+             "tools_unrendered": 0, "template_style": args.template_style}
     lengths = []
 
-    assistant_ids = tok("<|im_start|>assistant\n", add_special_tokens=False).input_ids
-    im_end_ids = tok("<|im_end|>", add_special_tokens=False).input_ids
+    assistant_ids = header_ids
+    im_end_ids = tok(style["turn_end"], add_special_tokens=False).input_ids
+    tools_marker = "</tools>" if style["supports_tools"] else None
 
     out = open(args.bin, "wb")
     meta = open(args.meta, "w", encoding="utf-8")
@@ -99,33 +155,41 @@ def main(argv=None):
             stats["total"] += 1
             if stats["total"] % args.progress_every == 0:
                 print(f"... {stats['total']} rows, over_long={stats['over_long']}", flush=True)
-            tools = parse_tools(row.get("tools"))
+            try:
+                tools = parse_tools(row.get("tools"))
+            except ToolsParseError:
+                stats["tools_parse_errors"] += 1
+                continue
             if tools:
                 stats["rows_with_tools"] += 1
+                if not style["supports_tools"]:
+                    # Counted separately: schema present but this template can
+                    # not render it; trained as a tools-free conversation.
+                    stats["tools_unrendered"] += 1
             try:
                 messages = json.loads(row["messages"])
-                text, ids = render_row(tok, messages, tools)
+                text, ids = render_row(tok, messages, tools, style)
             except Exception:
                 stats["errors"] += 1
                 continue
-            if tools and "</tools>" not in text:
+            if tools and style["supports_tools"] and tools_marker not in text:
                 # A schema list that renders without the tools block means the
                 # tokenizer template ignored it; training would silently diverge
                 # from eval, so count it and fall back to the plain rendering.
                 stats["tools_parse_errors"] += 1
                 tools = None
                 try:
-                    text, ids = render_row(tok, messages, None)
+                    text, ids = render_row(tok, messages, None, style)
                 except Exception:
                     stats["errors"] += 1
                     continue
-            if tools:
+            if tools and style["supports_tools"]:
                 stats["tools_block_rendered"] += 1
 
-            keep = min(len(ids), args.max_tokens)
             if len(ids) > args.max_tokens:
                 stats["over_long"] += 1
-
+                continue
+            keep = len(ids)
             sup = assistant_sup_intervals(ids, assistant_ids, im_end_ids, keep)
             if not sup:
                 stats["errors"] += 1
@@ -147,11 +211,11 @@ def main(argv=None):
     n = len(lengths)
     stats.update({
         "kept": n,
-        "mean_len": round(sum(lengths) / n, 1),
-        "p50": lengths[n // 2],
-        "p90": lengths[int(n * 0.9)],
-        "p99": lengths[int(n * 0.99)],
-        "max": lengths[-1],
+        "mean_len": round(sum(lengths) / n, 1) if n else 0,
+        "p50": lengths[n // 2] if n else 0,
+        "p90": lengths[int(n * 0.9)] if n else 0,
+        "p99": lengths[int(n * 0.99)] if n else 0,
+        "max": lengths[-1] if n else 0,
         "le_256": sum(l <= 256 for l in lengths),
         "le_512": sum(256 < l <= 512 for l in lengths),
         "le_1024": sum(512 < l <= 1024 for l in lengths),
